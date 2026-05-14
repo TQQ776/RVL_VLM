@@ -1,0 +1,20 @@
+/**:
+  quest3_pose_to_twist:
+    ros__parameters:
+      # Controller-to-base axis mapping.
+      # Output order is [base_x, base_y, base_z].
+      # Each value selects the source controller axis; prefix '-' to invert it.
+      #
+      # Current mapping:
+      #   base_x <- controller_x
+      #   base_y <- controller_z
+      #   base_z <- controller_y
+      linear_axis_map: ["x", "z", "y"]
+      angular_axis_map: ["-x", "-z", "-y"]
+
+      # Keep the mapping purely from this YAML file, without extra heading rotation.
+      use_heading_calibration: false
+
+      # hand_velocity: robot moves only while the controller is moving.
+      # anchor_offset: old behavior; robot keeps moving while the controller is offset from the enable anchor.
+      motion_mode: hand_velocity

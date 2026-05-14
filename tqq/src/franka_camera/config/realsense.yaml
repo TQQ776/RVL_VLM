@@ -1,0 +1,26 @@
+/**:
+  ros__parameters:
+    # Streams (depth disabled for calibration to dodge USB bandwidth issues;
+    # re-enable after calibration succeeds, or use only color downstream)
+    enable_color: true
+    enable_depth: false
+    enable_infra1: false
+    enable_infra2: false
+    enable_gyro: false
+    enable_accel: false
+
+    # Resolutions / fps
+    rgb_camera.color_profile: "640,480,30"
+    depth_module.depth_profile: "640,480,30"
+
+    # Depth-color alignment (no-op when depth disabled)
+    align_depth.enable: false
+
+    # Point cloud (off; needs depth)
+    pointcloud.enable: false
+    pointcloud.stream_filter: 2
+
+    # Misc
+    initial_reset: true
+    publish_tf: true
+    tf_publish_rate: 0.0

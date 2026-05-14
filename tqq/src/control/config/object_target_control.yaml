@@ -1,0 +1,95 @@
+/**:
+  ros__parameters:
+    detections_topic: /mcp_omni_client/api_detections_json
+    detected_objects_topic: /object_target_controller/detected_objects
+    target_command_topic: /object_target_controller/target_class_name
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/camera/color/camera_info
+    joint_states_topic: /joint_states
+
+    base_frame: fr3_link0
+    camera_frame: ''
+    use_latest_tf: true
+    end_effector_frame: fr3_hand_tcp
+    move_group_name: fr3_arm
+
+    ik_service: /compute_ik
+    cartesian_path_service: /compute_cartesian_path
+    move_group_action: /move_action
+    trajectory_action: /fr3_arm_controller/follow_joint_trajectory
+    execution_mode: move_group
+    plan_only: false
+    auto_execute: false
+    auto_execute_cooldown_sec: 5.0
+    ask_for_target: true
+    execute_on_target_command: true
+    detected_objects_log_interval_sec: 2.0
+
+    target_class_name: ''
+    target_class_id: -1
+    min_confidence: 0.30
+    depth_window_radius_px: 3
+    depth_unit_scale: 0.001
+    min_depth_m: 0.05
+    max_depth_m: 3.0
+    max_detection_depth_time_delta_sec: 0.5
+
+    target_offset_xyz_base: [-0.02, 0.0, 0.0]
+    grasp_final_z_offset_m: -0.06
+    # Safer grasp strategy:
+    # 1) move in XY at the current height until the gripper is above the object,
+    # 2) descend vertically in Z to the final grasp height.
+    staged_grasp_motion: true
+    use_cartesian_staged_motion: false
+    # Keep both staged points as normal MoveIt IK + MoveGroup motions:
+    #   1) (target x, target y, current z)
+    #   2) (current x, current y, target z)
+    # This keeps the same smooth planner behavior as the original one-shot
+    # grasp while avoiding a diagonal final approach.
+    cartesian_staged_segments: [none]
+    allow_cartesian_staged_fallback: false
+    cartesian_max_step_m: 0.01
+    cartesian_jump_threshold: 0.0
+    cartesian_min_fraction: 0.95
+    min_grasp_z_m: 0.05
+    max_staged_xy_distance_m: 0.40
+    max_staged_vertical_descend_m: 0.35
+    close_gripper_after_motion: true
+    close_gripper_on_service_motion: false
+    gripper_grasp_actions:
+      - /franka_gripper/grasp
+      - /fr3_gripper/grasp
+      - /left_fr3_gripper/grasp
+    gripper_server_wait_timeout_sec: 1.0
+    gripper_action_timeout_sec: 10.0
+    gripper_close_width_m: 0.0
+    gripper_close_speed_mps: 0.03
+    gripper_close_force_n: 50.0
+    gripper_grasp_epsilon_inner_m: 0.01
+    # Keep this large enough for object thickness, otherwise Franka reports
+    # grasp failure after contact and the fingers may stop holding force.
+    gripper_grasp_epsilon_outer_m: 0.08
+
+    orientation_mode: current
+    fixed_orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+    avoid_collisions: true
+    ik_timeout_sec: 0.5
+    service_wait_timeout_sec: 5.0
+    action_wait_timeout_sec: 10.0
+    motion_duration_sec: 4.0
+    move_group_result_timeout_sec: 90.0
+    goal_joint_tolerance: 0.01
+    max_velocity_scaling: 0.01
+    max_acceleration_scaling: 0.01
+    num_planning_attempts: 5
+    allowed_planning_time: 5.0
+
+    arm_joints:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7

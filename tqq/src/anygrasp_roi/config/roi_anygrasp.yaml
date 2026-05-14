@@ -1,0 +1,77 @@
+/**:
+  ros__parameters:
+    color_topic: /camera/camera/color/image_raw
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/camera/color/camera_info
+    joint_states_topic: /joint_states
+
+    base_frame: fr3_link0
+    camera_frame: ''
+    use_latest_tf: true
+    end_effector_frame: fr3_hand_tcp
+    move_group_name: fr3_arm
+
+    ik_service: /compute_ik
+    move_group_action: /move_action
+    plan_only: false
+    avoid_collisions: true
+    ik_timeout_sec: 0.5
+    service_wait_timeout_sec: 5.0
+    action_wait_timeout_sec: 10.0
+    move_group_result_timeout_sec: 90.0
+    goal_joint_tolerance: 0.01
+    max_velocity_scaling: 0.01
+    max_acceleration_scaling: 0.01
+    num_planning_attempts: 5
+    allowed_planning_time: 5.0
+
+    roi_window_name: AnyGrasp ROI Selector
+    roi_padding_px: 8
+    depth_unit_scale: 0.001
+    min_depth_m: 0.05
+    max_depth_m: 3.0
+
+    anygrasp_sdk_dir: /home/tqq/TQQ_ws/third_party/anygrasp_sdk
+    anygrasp_checkpoint_path: /home/tqq/TQQ_ws/third_party/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar
+    anygrasp_require_license: true
+    anygrasp_min_points: 200
+    anygrasp_max_gripper_width: 0.08
+    anygrasp_gripper_height: 0.03
+    anygrasp_top_down_grasp: false
+    anygrasp_debug: false
+    anygrasp_apply_object_mask: true
+    anygrasp_dense_grasp: false
+    anygrasp_collision_detection: true
+    anygrasp_workspace_margin_m: 0.02
+    anygrasp_orientation_mode: anygrasp
+    anygrasp_fallback_to_current_orientation: false
+    anygrasp_tcp_rotation_rpy_grasp: [0.0, 1.57079632679, 0.0]
+    anygrasp_tcp_offset_xyz_grasp: [0.0, 0.0, 0.0]
+    target_offset_xyz_base: [0.0, 0.0, 0.0]
+    min_grasp_z_m: -10.0
+
+    popup_preview_before_execute: true
+    popup_preview_max_points: 20000
+    popup_preview_frame_size_m: 0.08
+    popup_preview_window_title: AnyGrasp ROI grasp preview
+
+    gripper_grasp_actions:
+      - /franka_gripper/grasp
+      - /fr3_gripper/grasp
+      - /left_fr3_gripper/grasp
+    gripper_server_wait_timeout_sec: 1.0
+    gripper_action_timeout_sec: 10.0
+    gripper_close_width_m: 0.0
+    gripper_close_speed_mps: 0.03
+    gripper_close_force_n: 50.0
+    gripper_grasp_epsilon_inner_m: 0.01
+    gripper_grasp_epsilon_outer_m: 0.08
+
+    arm_joints:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7

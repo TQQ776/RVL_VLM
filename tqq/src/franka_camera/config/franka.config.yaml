@@ -1,0 +1,15 @@
+# Custom franka_bringup config for hand-eye calibration.
+# Used with: ros2 launch franka_bringup example.launch.py \
+#   robot_config_file:=$(ros2 pkg prefix franka_camera)/share/franka_camera/config/franka.config.yaml \
+#   controller_names:=gravity_compensation_example_controller
+
+ROBOT1:
+  robot_type: "fr3"
+  arm_prefix: ""
+  fake_sensor_commands: "false"
+  joint_state_rate: 30
+  load_gripper: "true"       # Franka Hand mounted -> URDF includes fr3_hand / fr3_hand_tcp
+  namespace: ""              # empty -> topics/TFs without NS_1 prefix
+  robot_ip: "192.168.22.212"
+  use_fake_hardware: "false"
+  use_rviz: "false"

@@ -1,0 +1,34 @@
+doubao_vision_box:
+  ros__parameters:
+    image_topic: /camera/camera/color/image_raw
+    command_topic: /doubao_vision_box/command
+    annotated_topic: /doubao_vision_box/annotated_image
+    result_topic: /doubao_vision_box/result_json
+
+    # 普通看图对话和框选坐标都走 Doubao-Seed 多模态模型。
+    model: doubao-seed-2-0-pro-260215
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    api_key_env: ARK_API_KEY
+    timeout_sec: 90.0
+
+    # 默认用 PNG 无损发送当前相机原图，不压缩、不缩放。
+    image_format: png
+    # auto: 普通看图问题走自然对话；“框选/框出/标注...”走百分比定位 JSON，再在原图本地画框。
+    # direct: 只做普通看图对话。
+    # box_percent: 强制走百分比定位 JSON。
+    vision_mode: auto
+    jpeg_quality: 90
+    max_image_width: 0
+    max_cached_image_age_sec: 5.0
+
+    output_dir: /home/tqq/TQQ_ws/doubao_vision_outputs
+    show_window: true
+    window_name: Doubao Vision Box
+    save_images: true
+
+    # 默认不使用终端输入；按 text_popup_key 弹出文本对话框。
+    enable_stdin: false
+    text_popup_enabled: true
+    text_popup_key: t
+    text_popup_title: Doubao Vision Box
+    text_popup_prompt: 输入文本后按 Ctrl+Enter 发送，或按 Esc 取消。

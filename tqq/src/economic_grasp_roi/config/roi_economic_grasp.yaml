@@ -1,0 +1,103 @@
+/**:
+  ros__parameters:
+    color_topic: /camera/camera/color/image_raw
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/camera/color/camera_info
+    joint_states_topic: /joint_states
+    api_detections_topic: /mcp_omni_client/api_detections_json
+    target_command_topic: /economic_grasp_roi/target_class_name
+    enable_api_bbox: true
+    auto_execute_api_bbox: true
+    api_bbox_target_timeout_sec: 5.0
+    api_bbox_depth_percentile: 35.0
+    api_bbox_depth_margin_m: 0.08
+    api_bbox_erode_px: 1
+
+    base_frame: fr3_link0
+    camera_frame: ''
+    use_latest_tf: true
+    end_effector_frame: fr3_hand_tcp
+    move_group_name: fr3_arm
+
+    ik_service: /compute_ik
+    cartesian_path_service: /compute_cartesian_path
+    move_group_action: /move_action
+    trajectory_action: /fr3_arm_controller/follow_joint_trajectory
+    plan_only: false
+    avoid_collisions: true
+    ik_timeout_sec: 0.5
+    service_wait_timeout_sec: 5.0
+    action_wait_timeout_sec: 10.0
+    move_group_result_timeout_sec: 90.0
+    goal_joint_tolerance: 0.01
+    max_velocity_scaling: 0.01
+    max_acceleration_scaling: 0.01
+    num_planning_attempts: 5
+    allowed_planning_time: 5.0
+    staged_grasp_enabled: true
+    pre_grasp_lift_m: 0.08
+    cartesian_descend_m: 0.08
+    cartesian_max_step_m: 0.002
+    cartesian_jump_threshold: 0.0
+    cartesian_min_fraction: 0.95
+    cartesian_descend_duration_sec: 6.0
+
+    roi_window_name: EconomicGrasp ROI Selector
+    roi_padding_px: 8
+    depth_unit_scale: 0.001
+    min_depth_m: 0.05
+    max_depth_m: 3.0
+
+    economic_grasp_repo_dir: /home/tqq/TQQ_ws/third_party/EconomicGrasp
+    economic_grasp_checkpoint_path: /home/tqq/TQQ_ws/third_party/EconomicGrasp/checkpoints/economicgrasp_realsense.tar
+    economic_grasp_num_point: 20000
+    economic_grasp_m_point: 1024
+    economic_grasp_num_view: 300
+    economic_grasp_num_angle: 12
+    economic_grasp_num_depth: 4
+    economic_grasp_grasp_max_width: 0.1
+    economic_grasp_graspness_threshold: 0.1
+    economic_grasp_voxel_size: 0.005
+    economic_grasp_collision_thresh: 0.01
+    economic_grasp_collision_approach_dist: 0.05
+    economic_grasp_min_points: 200
+    economic_grasp_use_nms: true
+    economic_grasp_nms_translation_thresh: 0.03
+    economic_grasp_nms_rotation_thresh_deg: 30.0
+    grasp_center_filter_enabled: true
+    grasp_center_max_xy_offset_m: 0.025
+    economic_grasp_device: cuda:0
+
+    economic_grasp_orientation_mode: yaw_only
+    economic_grasp_fallback_to_current_orientation: false
+    economic_grasp_tcp_rotation_rpy_grasp: [0.0, 1.57079632679, 0.0]
+    economic_grasp_tcp_offset_xyz_grasp: [0.0, 0.0, 0.0]
+    target_offset_xyz_base: [0.0, 0.0, -0.04]
+    min_grasp_z_m: -10.0
+
+    popup_preview_before_execute: true
+    popup_preview_require_confirmation: false
+    popup_preview_max_points: 20000
+    popup_preview_frame_size_m: 0.08
+    popup_preview_window_title: EconomicGrasp ROI grasp preview
+
+    gripper_grasp_actions:
+      - /franka_gripper/grasp
+      - /fr3_gripper/grasp
+      - /left_fr3_gripper/grasp
+    gripper_server_wait_timeout_sec: 1.0
+    gripper_action_timeout_sec: 10.0
+    gripper_close_width_m: 0.0
+    gripper_close_speed_mps: 0.03
+    gripper_close_force_n: 50.0
+    gripper_grasp_epsilon_inner_m: 0.01
+    gripper_grasp_epsilon_outer_m: 0.08
+
+    arm_joints:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7

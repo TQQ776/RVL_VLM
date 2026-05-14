@@ -1,0 +1,49 @@
+# ROS/colcon build outputs
+build/
+install/
+log/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Native build/cache files
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+*.o
+*.so
+*.a
+
+# Runtime outputs and local captures
+doubao_vision_outputs/
+omni_vision_outputs/
+*.bag
+*.db3
+
+# Large ML model/checkpoint files
+*.pt
+*.pth
+*.onnx
+*.engine
+*.ckpt
+*.tar
+tqq/src/speech/model/*
+!tqq/src/speech/model/.gitkeep
+
+# Local backups
+*.bak
+*.bak_*
+
+# Local/editor/private files
+.codex
+.env
+*.local
+草稿.md
+
+# Third-party source trees kept locally, installed separately
+third_party/
+franka/
+tqq/src/easy_handeye2/

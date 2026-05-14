@@ -1,0 +1,48 @@
+/**:
+  controller_manager:
+    ros__parameters:
+      update_rate: 1000
+      thread_priority: 98
+
+      joint_state_broadcaster:
+        type: joint_state_broadcaster/JointStateBroadcaster
+
+      franka_robot_state_broadcaster:
+        type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+        state_interfaces:
+          robot_state
+
+      vr_cartesian_velocity_controller:
+        type: franka_vr_teleop/VRCartesianVelocityController
+
+/**:
+  joint_state_broadcaster:
+    ros__parameters:
+      robot_type: fr3
+      joints:
+        - fr3_joint1
+        - fr3_joint2
+        - fr3_joint3
+        - fr3_joint4
+        - fr3_joint5
+        - fr3_joint6
+        - fr3_joint7
+
+/**:
+  franka_robot_state_broadcaster:
+    ros__parameters:
+      lock_try_count: 5
+      lock_sleep_interval: 5
+      lock_log_error: true
+      lock_update_success: false
+
+/**:
+  vr_cartesian_velocity_controller:
+    ros__parameters:
+      twist_topic: ~/twist_cmd
+      command_timeout_sec: 0.20
+      max_linear_velocity_mps: 0.12
+      max_angular_velocity_radps: 0.25
+      max_linear_acceleration_mps2: 0.12
+      max_angular_acceleration_radps2: 0.30
+      lowpass_alpha: 0.03

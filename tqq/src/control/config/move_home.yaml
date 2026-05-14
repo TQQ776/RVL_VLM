@@ -1,0 +1,17 @@
+/**:
+  ros__parameters:
+    trajectory_action: /fr3_arm_controller/follow_joint_trajectory
+    joint_names:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7
+    home_joint_positions_deg: [74.0, -3.0, -7.0, -115.0, -1.0, 110.0, 22.0]
+    move_duration_sec: 4.0
+    trajectory_dt_sec: 0.05
+    trajectory_start_delay_sec: 0.1
+    wait_for_joint_state_sec: 3.0
+    wait_for_server_sec: 10.0

@@ -1320,10 +1320,11 @@ class RoiEconomicGraspController(Node):
                 colors=payload['colors'],
                 origin=payload['origin'],
                 rotation=payload['rotation'],
-                grasp_array=payload['grasp_array'],
+                gripper_width=np.asarray([payload['gripper_width']], dtype=np.float64),
+                gripper_height=np.asarray([payload['gripper_height']], dtype=np.float64),
+                gripper_depth=np.asarray([payload['gripper_depth']], dtype=np.float64),
                 frame_size=np.asarray([payload['frame_size']], dtype=np.float64),
                 title=np.asarray([payload['title']]),
-                economic_grasp_repo_dir=np.asarray([payload['economic_grasp_repo_dir']]),
             )
             preview_script = os.path.join(os.path.dirname(__file__), 'open3d_preview.py')
             log_file = open('/tmp/economic_grasp_open3d_preview.log', 'ab')
@@ -1361,12 +1362,6 @@ class RoiEconomicGraspController(Node):
 
         preview_pose = target.preview_camera_pose
         rotation = self._quaternion_to_rotation_matrix(preview_pose.pose.orientation)
-        mesh_axis_to_tcp_axis = np.asarray([
-            [0.0, 0.0, -1.0],
-            [0.0, 1.0, 0.0],
-            [1.0, 0.0, 0.0],
-        ], dtype=np.float64)
-        gripper_rotation = rotation.dot(mesh_axis_to_tcp_axis)
         translation = np.asarray([
             preview_pose.pose.position.x,
             preview_pose.pose.position.y,
@@ -1375,17 +1370,6 @@ class RoiEconomicGraspController(Node):
         width = target.grasp_width if math.isfinite(target.grasp_width) else 0.06
         height = target.grasp_height if math.isfinite(target.grasp_height) else 0.02
         depth = target.grasp_depth if math.isfinite(target.grasp_depth) else 0.02
-        grasp_array = np.concatenate([
-            np.asarray([
-                target.grasp_score,
-                min(0.12, max(0.0, float(width))),
-                min(0.08, max(0.004, float(height))),
-                min(0.12, max(0.0, float(depth))),
-            ], dtype=np.float64),
-            gripper_rotation.reshape(-1),
-            translation,
-            np.asarray([-1.0], dtype=np.float64),
-        ]).reshape(1, 17)
         title = (
             f'{self.popup_preview_window_title} - '
             f'score={target.grasp_score:.3f} width={target.grasp_width:.3f}m '
@@ -1396,10 +1380,11 @@ class RoiEconomicGraspController(Node):
             'colors': np.clip(colors, 0.0, 1.0).astype(np.float32, copy=True),
             'origin': translation.astype(np.float64, copy=True),
             'rotation': rotation.astype(np.float64, copy=True),
-            'grasp_array': grasp_array.astype(np.float64, copy=True),
+            'gripper_width': min(0.12, max(0.0, float(width))),
+            'gripper_height': min(0.08, max(0.004, float(height))),
+            'gripper_depth': min(0.12, max(0.0, float(depth))),
             'frame_size': max(0.01, self.popup_preview_frame_size_m),
             'title': title,
-            'economic_grasp_repo_dir': os.path.expanduser(self.economic_grasp_repo_dir),
         }
 
     def _show_open3d_preview_nonblocking(self, target: RoiEconomicGraspTarget) -> None:
@@ -1498,17 +1483,7 @@ class RoiEconomicGraspController(Node):
         pose: PoseStamped,
         target: RoiEconomicGraspTarget,
     ) -> List:
-        GraspGroup = self._import_graspnet_api_grasp_group()
         rotation = self._quaternion_to_rotation_matrix(pose.pose.orientation)
-        # graspnetAPI draws the gripper approach along local +X and the side
-        # face normal along local +Y.  In the fr3_hand_tcp preview frame those
-        # should align with +Z (blue) and +Y (green), respectively.
-        mesh_axis_to_tcp_axis = np.asarray([
-            [0.0, 0.0, -1.0],
-            [0.0, 1.0, 0.0],
-            [1.0, 0.0, 0.0],
-        ], dtype=np.float64)
-        gripper_rotation = rotation.dot(mesh_axis_to_tcp_axis)
         translation = np.asarray([
             pose.pose.position.x,
             pose.pose.position.y,
@@ -1517,39 +1492,77 @@ class RoiEconomicGraspController(Node):
         width = target.grasp_width if math.isfinite(target.grasp_width) else 0.06
         height = target.grasp_height if math.isfinite(target.grasp_height) else 0.02
         depth = target.grasp_depth if math.isfinite(target.grasp_depth) else 0.02
-        grasp_array = np.concatenate([
-            np.asarray([
-                target.grasp_score,
-                min(0.12, max(0.0, float(width))),
-                min(0.08, max(0.004, float(height))),
-                min(0.12, max(0.0, float(depth))),
-            ], dtype=np.float64),
-            gripper_rotation.reshape(-1),
+        return self._create_gripper_lineset(
+            rotation,
             translation,
-            np.asarray([-1.0], dtype=np.float64),
-        ]).reshape(1, 17)
-        return GraspGroup(grasp_array).to_open3d_geometry_list()
+            min(0.12, max(0.0, float(width))),
+            min(0.08, max(0.004, float(height))),
+            min(0.12, max(0.0, float(depth))),
+        )
 
-    def _import_graspnet_api_grasp_group(self):
-        if not hasattr(np, 'float'):
-            setattr(np, 'float', float)
-        third_party_dir = os.path.dirname(os.path.expanduser(self.economic_grasp_repo_dir))
-        candidates = [
-            os.path.join(third_party_dir, 'franka-graspnet-master', 'graspnetAPI'),
-            os.path.join(os.path.expanduser(self.economic_grasp_repo_dir), 'graspnetAPI'),
+    def _create_gripper_lineset(
+        self,
+        rotation: np.ndarray,
+        translation: np.ndarray,
+        width: float,
+        height: float,
+        depth: float,
+    ) -> List:
+        import open3d as o3d
+
+        finger_thickness = max(0.006, min(0.018, height * 0.6))
+        palm_depth = max(0.008, min(0.025, depth * 0.35))
+        opening = max(0.002, width)
+        finger_depth = max(0.015, depth)
+        finger_height = max(0.012, height)
+        palm_width = opening + 2.0 * finger_thickness
+
+        boxes = [
+            (
+                np.asarray([0.0, 0.5 * opening + 0.5 * finger_thickness, 0.5 * finger_depth]),
+                np.asarray([finger_height, finger_thickness, finger_depth]),
+            ),
+            (
+                np.asarray([0.0, -0.5 * opening - 0.5 * finger_thickness, 0.5 * finger_depth]),
+                np.asarray([finger_height, finger_thickness, finger_depth]),
+            ),
+            (
+                np.asarray([0.0, 0.0, -0.5 * palm_depth]),
+                np.asarray([finger_height, palm_width, palm_depth]),
+            ),
         ]
-        for path in candidates:
-            if os.path.isdir(path) and path not in sys.path:
-                sys.path.insert(0, path)
-        try:
-            from graspnetAPI import GraspGroup
-        except Exception as exc:
-            raise RuntimeError(
-                'Failed to import graspnetAPI.GraspGroup for official gripper preview. '
-                'Install graspnetAPI or keep third_party/franka-graspnet-master/graspnetAPI available. '
-                f'Original error: {exc}'
-            ) from exc
-        return GraspGroup
+        cube_lines = [
+            (0, 1), (1, 3), (3, 2), (2, 0),
+            (4, 5), (5, 7), (7, 6), (6, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+        points = []
+        lines = []
+        colors = []
+        for center, size in boxes:
+            base = len(points)
+            half = 0.5 * size
+            corners = [
+                [-half[0], -half[1], -half[2]],
+                [-half[0], -half[1], half[2]],
+                [-half[0], half[1], -half[2]],
+                [-half[0], half[1], half[2]],
+                [half[0], -half[1], -half[2]],
+                [half[0], -half[1], half[2]],
+                [half[0], half[1], -half[2]],
+                [half[0], half[1], half[2]],
+            ]
+            for corner in corners:
+                points.append(rotation.dot(center + np.asarray(corner, dtype=np.float64)) + translation)
+            for start, end in cube_lines:
+                lines.append([base + start, base + end])
+                colors.append([0.0, 0.85, 0.2])
+
+        line_set = o3d.geometry.LineSet()
+        line_set.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+        line_set.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
+        line_set.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
+        return [line_set]
 
     def _snapshot_rgbd(self):
         with self.state_lock:

@@ -25,7 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             'object_target_controller = control.object_target_controller:main',
-            'graspnet_target_controller = control.graspnet_target_controller:main',
             'object_target_cli = control.object_target_cli:main',
             'move_home = control.move_home:main',
         ],

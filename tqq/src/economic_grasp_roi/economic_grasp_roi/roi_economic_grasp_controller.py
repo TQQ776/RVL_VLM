@@ -1320,9 +1320,10 @@ class RoiEconomicGraspController(Node):
                 colors=payload['colors'],
                 origin=payload['origin'],
                 rotation=payload['rotation'],
+                gripper_rotation=payload['gripper_rotation'],
                 gripper_width=np.asarray([payload['gripper_width']], dtype=np.float64),
-                gripper_height=np.asarray([payload['gripper_height']], dtype=np.float64),
                 gripper_depth=np.asarray([payload['gripper_depth']], dtype=np.float64),
+                gripper_score=np.asarray([payload['gripper_score']], dtype=np.float64),
                 frame_size=np.asarray([payload['frame_size']], dtype=np.float64),
                 title=np.asarray([payload['title']]),
             )
@@ -1362,6 +1363,7 @@ class RoiEconomicGraspController(Node):
 
         preview_pose = target.preview_camera_pose
         rotation = self._quaternion_to_rotation_matrix(preview_pose.pose.orientation)
+        gripper_rotation = rotation.dot(self._preview_mesh_axis_to_tcp_axis())
         translation = np.asarray([
             preview_pose.pose.position.x,
             preview_pose.pose.position.y,
@@ -1380,9 +1382,10 @@ class RoiEconomicGraspController(Node):
             'colors': np.clip(colors, 0.0, 1.0).astype(np.float32, copy=True),
             'origin': translation.astype(np.float64, copy=True),
             'rotation': rotation.astype(np.float64, copy=True),
+            'gripper_rotation': gripper_rotation.astype(np.float64, copy=True),
             'gripper_width': min(0.12, max(0.0, float(width))),
-            'gripper_height': min(0.08, max(0.004, float(height))),
             'gripper_depth': min(0.12, max(0.0, float(depth))),
+            'gripper_score': min(1.0, max(0.0, float(target.grasp_score))),
             'frame_size': max(0.01, self.popup_preview_frame_size_m),
             'title': title,
         }
@@ -1484,21 +1487,120 @@ class RoiEconomicGraspController(Node):
         target: RoiEconomicGraspTarget,
     ) -> List:
         rotation = self._quaternion_to_rotation_matrix(pose.pose.orientation)
+        gripper_rotation = rotation.dot(self._preview_mesh_axis_to_tcp_axis())
         translation = np.asarray([
             pose.pose.position.x,
             pose.pose.position.y,
             pose.pose.position.z,
         ], dtype=np.float64)
         width = target.grasp_width if math.isfinite(target.grasp_width) else 0.06
-        height = target.grasp_height if math.isfinite(target.grasp_height) else 0.02
         depth = target.grasp_depth if math.isfinite(target.grasp_depth) else 0.02
-        return self._create_gripper_lineset(
-            rotation,
-            translation,
-            min(0.12, max(0.0, float(width))),
-            min(0.08, max(0.004, float(height))),
-            min(0.12, max(0.0, float(depth))),
+        return [
+            self._create_gripper_mesh(
+                gripper_rotation,
+                translation,
+                min(0.12, max(0.0, float(width))),
+                min(0.12, max(0.0, float(depth))),
+                min(1.0, max(0.0, float(target.grasp_score))),
+            )
+        ]
+
+    def _preview_mesh_axis_to_tcp_axis(self) -> np.ndarray:
+        # The preview mesh uses +X as the approach axis and +Y as the gripper
+        # opening axis. The preview pose is fr3_hand_tcp, where approach is
+        # +Z and opening is +Y.
+        return np.asarray([
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ], dtype=np.float64)
+
+    def _create_gripper_mesh(
+        self,
+        rotation: np.ndarray,
+        translation: np.ndarray,
+        width: float,
+        depth: float,
+        score: float,
+    ):
+        import open3d as o3d
+
+        height = 0.004
+        finger_width = 0.004
+        tail_length = 0.04
+        depth_base = 0.02
+
+        left = self._create_mesh_box(o3d, depth + depth_base + finger_width, finger_width, height)
+        right = self._create_mesh_box(o3d, depth + depth_base + finger_width, finger_width, height)
+        bottom = self._create_mesh_box(o3d, finger_width, width, height)
+        tail = self._create_mesh_box(o3d, tail_length, finger_width, height)
+
+        left_points = np.asarray(left.vertices)
+        left_triangles = np.asarray(left.triangles)
+        left_points[:, 0] -= depth_base + finger_width
+        left_points[:, 1] -= width / 2.0 + finger_width
+        left_points[:, 2] -= height / 2.0
+
+        right_points = np.asarray(right.vertices)
+        right_triangles = np.asarray(right.triangles) + 8
+        right_points[:, 0] -= depth_base + finger_width
+        right_points[:, 1] += width / 2.0
+        right_points[:, 2] -= height / 2.0
+
+        bottom_points = np.asarray(bottom.vertices)
+        bottom_triangles = np.asarray(bottom.triangles) + 16
+        bottom_points[:, 0] -= finger_width + depth_base
+        bottom_points[:, 1] -= width / 2.0
+        bottom_points[:, 2] -= height / 2.0
+
+        tail_points = np.asarray(tail.vertices)
+        tail_triangles = np.asarray(tail.triangles) + 24
+        tail_points[:, 0] -= tail_length + finger_width + depth_base
+        tail_points[:, 1] -= finger_width / 2.0
+        tail_points[:, 2] -= height / 2.0
+
+        vertices = np.concatenate(
+            [left_points, right_points, bottom_points, tail_points],
+            axis=0,
         )
+        vertices = rotation.dot(vertices.T).T + translation
+        triangles = np.concatenate(
+            [left_triangles, right_triangles, bottom_triangles, tail_triangles],
+            axis=0,
+        )
+        color = np.asarray([score, 0.0, 1.0 - score], dtype=np.float64)
+        colors = np.tile(color.reshape(1, 3), (len(vertices), 1))
+
+        gripper = o3d.geometry.TriangleMesh()
+        gripper.vertices = o3d.utility.Vector3dVector(vertices)
+        gripper.triangles = o3d.utility.Vector3iVector(triangles)
+        gripper.vertex_colors = o3d.utility.Vector3dVector(colors)
+        gripper.compute_vertex_normals()
+        return gripper
+
+    def _create_mesh_box(self, o3d, width: float, height: float, depth: float):
+        box = o3d.geometry.TriangleMesh()
+        vertices = np.asarray([
+            [0.0, 0.0, 0.0],
+            [width, 0.0, 0.0],
+            [0.0, 0.0, depth],
+            [width, 0.0, depth],
+            [0.0, height, 0.0],
+            [width, height, 0.0],
+            [0.0, height, depth],
+            [width, height, depth],
+        ], dtype=np.float64)
+        triangles = np.asarray([
+            [4, 7, 5], [4, 6, 7],
+            [0, 2, 4], [2, 6, 4],
+            [0, 1, 2], [1, 3, 2],
+            [1, 5, 7], [1, 7, 3],
+            [2, 3, 7], [2, 7, 6],
+            [0, 4, 1], [1, 4, 5],
+        ], dtype=np.int32)
+        box.vertices = o3d.utility.Vector3dVector(vertices)
+        box.triangles = o3d.utility.Vector3iVector(triangles)
+        return box
 
     def _create_gripper_lineset(
         self,

@@ -4,60 +4,84 @@ import sys
 import numpy as np
 
 
-def _create_gripper_lineset(o3d, rotation, translation, width, height, depth):
-    finger_thickness = max(0.006, min(0.018, height * 0.6))
-    palm_depth = max(0.008, min(0.025, depth * 0.35))
-    opening = max(0.002, width)
-    finger_depth = max(0.015, depth)
-    finger_height = max(0.012, height)
-    palm_width = opening + 2.0 * finger_thickness
+def _create_mesh_box(o3d, width, height, depth):
+    box = o3d.geometry.TriangleMesh()
+    vertices = np.asarray([
+        [0.0, 0.0, 0.0],
+        [width, 0.0, 0.0],
+        [0.0, 0.0, depth],
+        [width, 0.0, depth],
+        [0.0, height, 0.0],
+        [width, height, 0.0],
+        [0.0, height, depth],
+        [width, height, depth],
+    ], dtype=np.float64)
+    triangles = np.asarray([
+        [4, 7, 5], [4, 6, 7],
+        [0, 2, 4], [2, 6, 4],
+        [0, 1, 2], [1, 3, 2],
+        [1, 5, 7], [1, 7, 3],
+        [2, 3, 7], [2, 7, 6],
+        [0, 4, 1], [1, 4, 5],
+    ], dtype=np.int32)
+    box.vertices = o3d.utility.Vector3dVector(vertices)
+    box.triangles = o3d.utility.Vector3iVector(triangles)
+    return box
 
-    boxes = [
-        (
-            np.asarray([0.0, 0.5 * opening + 0.5 * finger_thickness, 0.5 * finger_depth]),
-            np.asarray([finger_height, finger_thickness, finger_depth]),
-        ),
-        (
-            np.asarray([0.0, -0.5 * opening - 0.5 * finger_thickness, 0.5 * finger_depth]),
-            np.asarray([finger_height, finger_thickness, finger_depth]),
-        ),
-        (
-            np.asarray([0.0, 0.0, -0.5 * palm_depth]),
-            np.asarray([finger_height, palm_width, palm_depth]),
-        ),
-    ]
-    cube_lines = [
-        (0, 1), (1, 3), (3, 2), (2, 0),
-        (4, 5), (5, 7), (7, 6), (6, 4),
-        (0, 4), (1, 5), (2, 6), (3, 7),
-    ]
-    points = []
-    lines = []
-    colors = []
-    for center, size in boxes:
-        base = len(points)
-        half = 0.5 * size
-        corners = [
-            [-half[0], -half[1], -half[2]],
-            [-half[0], -half[1], half[2]],
-            [-half[0], half[1], -half[2]],
-            [-half[0], half[1], half[2]],
-            [half[0], -half[1], -half[2]],
-            [half[0], -half[1], half[2]],
-            [half[0], half[1], -half[2]],
-            [half[0], half[1], half[2]],
-        ]
-        for corner in corners:
-            points.append(rotation.dot(center + np.asarray(corner, dtype=np.float64)) + translation)
-        for start, end in cube_lines:
-            lines.append([base + start, base + end])
-            colors.append([0.0, 0.85, 0.2])
 
-    line_set = o3d.geometry.LineSet()
-    line_set.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
-    line_set.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
-    line_set.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
-    return line_set
+def _create_gripper_mesh(o3d, rotation, translation, width, depth, score):
+    height = 0.004
+    finger_width = 0.004
+    tail_length = 0.04
+    depth_base = 0.02
+
+    left = _create_mesh_box(o3d, depth + depth_base + finger_width, finger_width, height)
+    right = _create_mesh_box(o3d, depth + depth_base + finger_width, finger_width, height)
+    bottom = _create_mesh_box(o3d, finger_width, width, height)
+    tail = _create_mesh_box(o3d, tail_length, finger_width, height)
+
+    left_points = np.asarray(left.vertices)
+    left_triangles = np.asarray(left.triangles)
+    left_points[:, 0] -= depth_base + finger_width
+    left_points[:, 1] -= width / 2.0 + finger_width
+    left_points[:, 2] -= height / 2.0
+
+    right_points = np.asarray(right.vertices)
+    right_triangles = np.asarray(right.triangles) + 8
+    right_points[:, 0] -= depth_base + finger_width
+    right_points[:, 1] += width / 2.0
+    right_points[:, 2] -= height / 2.0
+
+    bottom_points = np.asarray(bottom.vertices)
+    bottom_triangles = np.asarray(bottom.triangles) + 16
+    bottom_points[:, 0] -= finger_width + depth_base
+    bottom_points[:, 1] -= width / 2.0
+    bottom_points[:, 2] -= height / 2.0
+
+    tail_points = np.asarray(tail.vertices)
+    tail_triangles = np.asarray(tail.triangles) + 24
+    tail_points[:, 0] -= tail_length + finger_width + depth_base
+    tail_points[:, 1] -= finger_width / 2.0
+    tail_points[:, 2] -= height / 2.0
+
+    vertices = np.concatenate(
+        [left_points, right_points, bottom_points, tail_points],
+        axis=0,
+    )
+    vertices = rotation.dot(vertices.T).T + translation
+    triangles = np.concatenate(
+        [left_triangles, right_triangles, bottom_triangles, tail_triangles],
+        axis=0,
+    )
+    color = np.asarray([score, 0.0, 1.0 - score], dtype=np.float64)
+    colors = np.tile(color.reshape(1, 3), (len(vertices), 1))
+
+    gripper = o3d.geometry.TriangleMesh()
+    gripper.vertices = o3d.utility.Vector3dVector(vertices)
+    gripper.triangles = o3d.utility.Vector3iVector(triangles)
+    gripper.vertex_colors = o3d.utility.Vector3dVector(colors)
+    gripper.compute_vertex_normals()
+    return gripper
 
 
 def main() -> int:
@@ -75,9 +99,10 @@ def main() -> int:
         colors = np.asarray(data['colors'], dtype=np.float64)
         origin = np.asarray(data['origin'], dtype=np.float64).reshape(3)
         rotation = np.asarray(data['rotation'], dtype=np.float64).reshape(3, 3)
+        gripper_rotation = np.asarray(data['gripper_rotation'], dtype=np.float64).reshape(3, 3)
         gripper_width = float(np.asarray(data['gripper_width']).reshape(-1)[0])
-        gripper_height = float(np.asarray(data['gripper_height']).reshape(-1)[0])
         gripper_depth = float(np.asarray(data['gripper_depth']).reshape(-1)[0])
+        gripper_score = float(np.asarray(data['gripper_score']).reshape(-1)[0])
         frame_size = float(np.asarray(data['frame_size']).reshape(-1)[0])
         title = str(np.asarray(data['title']).reshape(-1)[0])
 
@@ -92,13 +117,13 @@ def main() -> int:
         pose_frame.rotate(rotation, center=origin.tolist())
         geometries = [cloud, pose_frame]
         geometries.append(
-            _create_gripper_lineset(
+            _create_gripper_mesh(
                 o3d,
-                rotation,
+                gripper_rotation,
                 origin,
                 gripper_width,
-                gripper_height,
                 gripper_depth,
+                gripper_score,
             )
         )
 

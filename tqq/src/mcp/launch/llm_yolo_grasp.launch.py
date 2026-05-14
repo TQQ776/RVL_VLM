@@ -47,7 +47,11 @@ def generate_launch_description():
         DeclareLaunchArgument('use_fake_hardware', default_value='false'),
         DeclareLaunchArgument('camera_namespace', default_value='camera'),
         DeclareLaunchArgument('camera_name', default_value='camera'),
-        DeclareLaunchArgument('camera_serial_no', default_value=''),
+        DeclareLaunchArgument(
+            'camera_serial_no',
+            default_value='327122079035',
+            description='RealSense serial number for the hand-mounted D435i camera.',
+        ),
         DeclareLaunchArgument('image_topic', default_value='/camera/camera/color/image_raw'),
         DeclareLaunchArgument('depth_topic', default_value='/camera/camera/aligned_depth_to_color/image_raw'),
         DeclareLaunchArgument('camera_info_topic', default_value='/camera/camera/color/camera_info'),

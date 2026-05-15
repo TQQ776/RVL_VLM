@@ -1,0 +1,6 @@
+string name
+string arguments_json
+---
+bool success
+string message
+string result_json

@@ -8,6 +8,8 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/CallTool.srv"
+  "srv/ListTools.srv"
   "srv/MoveAxis.srv"
   "srv/ObjectName.srv"
   DEPENDENCIES std_msgs

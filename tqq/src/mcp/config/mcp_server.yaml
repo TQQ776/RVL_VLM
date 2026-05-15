@@ -67,9 +67,42 @@
     # pipeline is handled by control/object_target_controller.
     detected_objects_topic: /object_target_controller/detected_objects
     target_command_topic: /object_target_controller/target_class_name
+    api_detections_topic: /mcp_omni_client/api_detections_json
     yolo_detect_once_service: /yolo/detect_once
     yolo_detection_wait_timeout_sec: 5.0
     target_command_settle_sec: 0.3
     detected_objects_max_age_sec: 2.0
     require_detected_before_grab: true
     require_target_command_subscriber: true
+
+    # Server-side MCP tools. The client only asks the LLM which tool to call;
+    # camera capture, Qwen vision, bbox drawing, and EconomicGrasp ROI publishing
+    # are owned by mcp_server.
+    omni_api_key_env: DASHSCOPE_API_KEY
+    omni_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    omni_text_model: qwen3.5-omni-plus
+    omni_timeout: 90.0
+    omni_max_tokens: 1000
+
+    vision_enabled: true
+    vision_image_topic: /camera/camera/color/image_raw
+    vision_max_image_width: 0
+    vision_jpeg_quality: 85
+    vision_image_max_age_sec: 30.0
+    vision_show_window: true
+    vision_window_name: Qwen-Omni Vision Box
+    vision_save_images: true
+    vision_output_dir: /home/tqq/TQQ_ws/omni_vision_outputs
+    vision_result_hold_sec: 60.0
+
+    api_detection_default_confidence: 0.90
+    api_detection_publish_settle_sec: 0.25
+    api_detection_republish_count: 3
+    api_detection_republish_interval_sec: 0.15
+    # Qwen-Omni/VLM boxes are commonly returned in a 0-1000 visual coordinate space.
+    api_detection_box_coordinate_space: qwen_1000
+    api_detection_box_reference_size: 1000.0
+    grab_api_default_motion_speed: 0.05
+    grasp_result_topic: /economic_grasp_roi/grasp_result
+    grab_api_wait_for_result: true
+    grab_api_result_timeout_sec: 180.0

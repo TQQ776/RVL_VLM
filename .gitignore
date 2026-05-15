@@ -30,8 +30,7 @@ omni_vision_outputs/
 *.engine
 *.ckpt
 *.tar
-tqq/src/speech/model/*
-!tqq/src/speech/model/.gitkeep
+!third_party/EconomicGrasp/checkpoints/economicgrasp_realsense.tar
 
 # Local backups
 *.bak
@@ -43,7 +42,15 @@ tqq/src/speech/model/*
 *.local
 草稿.md
 
-# Third-party source trees kept locally, installed separately
-third_party/
-franka/
-tqq/src/easy_handeye2/
+# Third-party source trees are vendored, but their local build/cache metadata is not.
+franka/build/
+franka/install/
+franka/log/
+franka/src/**/.git/
+third_party/**/.git/
+third_party/**/build/
+third_party/**/dist/
+third_party/**/*.egg-info/
+third_party/**/*.egg
+third_party/**/__pycache__/
+tqq/src/easy_handeye2/**/.git/

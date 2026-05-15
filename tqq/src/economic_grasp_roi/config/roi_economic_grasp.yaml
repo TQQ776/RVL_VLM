@@ -6,6 +6,7 @@
     joint_states_topic: /joint_states
     api_detections_topic: /mcp_omni_client/api_detections_json
     target_command_topic: /economic_grasp_roi/target_class_name
+    grasp_result_topic: /economic_grasp_roi/grasp_result
     enable_api_bbox: true
     auto_execute_api_bbox: true
     api_bbox_target_timeout_sec: 5.0
@@ -66,6 +67,18 @@
     economic_grasp_nms_rotation_thresh_deg: 30.0
     grasp_center_filter_enabled: true
     grasp_center_max_xy_offset_m: 0.025
+    grasp_center_priority_enabled: true
+    grasp_center_core_radius_m: 0.012
+    grasp_center_fallback_nearest_count: 5
+    grasp_center_score_weight: 0.20
+    gripper_body_collision_filter_enabled: true
+    gripper_body_collision_min_clearance_m: 0.002
+    gripper_body_collision_finger_width_m: 0.004
+    gripper_body_collision_finger_length_m: 0.000
+    gripper_body_collision_palm_depth_m: 0.020
+    gripper_body_collision_height_m: 0.004
+    gripper_body_collision_max_points: 12000
+    gripper_body_collision_allowed_points: 8
     economic_grasp_device: cuda:0
 
     economic_grasp_orientation_mode: yaw_only

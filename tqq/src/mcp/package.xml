@@ -19,7 +19,7 @@
   <depend>moveit_msgs</depend>
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
-  <depend>speech</depend>
+  <depend>audio_dialog</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>tf2_ros</depend>

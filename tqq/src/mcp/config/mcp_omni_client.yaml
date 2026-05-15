@@ -10,7 +10,7 @@
     channels: 1
     audio_device: default
     record_format: S16_LE
-    output_dir: /tmp/speech
+    output_dir: /tmp/audio_dialog
 
     no_speech_text: 没有听到清楚的语音，请再说一次。
 
@@ -38,52 +38,22 @@
     omni_timeout: 90.0
     omni_max_tokens: 1000
 
-    vision_enabled: true
-    vision_auto_attach_to_turns: false
-    vision_image_topic: /camera/camera/color/image_raw
-    vision_max_image_width: 0
-    vision_jpeg_quality: 85
-    vision_image_max_age_sec: 30.0
-    vision_show_window: true
-    vision_window_name: Qwen-Omni Vision Box
-    vision_save_images: true
-    vision_output_dir: /home/tqq/TQQ_ws/omni_vision_outputs
-    vision_result_hold_sec: 60.0
-
     play_tts: true
 
-    push_to_talk_enabled: true
+    list_tools_service: /mcp_server/list_tools
+    call_tool_service: /mcp_server/call_tool
+    push_to_talk_enabled: false
     push_to_talk_key: r
     stop_record_key: q
     min_record_seconds: 0.3
     text_popup_enabled: true
     text_popup_key: t
     text_popup_title: MCP 文本输入
-    text_popup_prompt: 输入文本后按 Ctrl+Enter 发送，或按 Esc 取消。
+    text_popup_prompt: 输入文本后按 Enter 发送，Shift+Enter 换行；也可以点击录音按钮语音输入。
+    text_popup_auto_open: true
 
-    go_home_service: /mcp_server/go_home
-    move_x_service: /mcp_server/move_x_cm
-    move_y_service: /mcp_server/move_y_cm
-    move_z_service: /mcp_server/move_z_cm
-    list_yolo_objects_service: /mcp_server/list_yolo_objects
-    grab_object_service: /mcp_server/grab_object
-    open_gripper_service: /mcp_server/open_gripper
-    close_gripper_service: /mcp_server/close_gripper
     mcp_service_wait_timeout_sec: 10.0
-    mcp_tool_timeout_sec: 80.0
-    detected_objects_topic: /object_target_controller/detected_objects
-    yolo_objects_max_age_sec: 5.0
-    llm_resolve_grasp_target: true
-    api_detections_topic: /mcp_omni_client/api_detections_json
-    target_command_topic: /economic_grasp_roi/target_class_name
-    api_detection_default_confidence: 0.90
-    api_detection_publish_settle_sec: 0.25
-    api_detection_republish_count: 3
-    api_detection_republish_interval_sec: 0.15
-    # Qwen-Omni/VLM boxes are commonly returned in a 0-1000 visual coordinate space.
-    # The client normalizes them first, then maps to the real camera image size.
-    api_detection_box_coordinate_space: qwen_1000
-    api_detection_box_reference_size: 1000.0
-    grab_api_default_motion_speed: 0.05
+    mcp_tool_timeout_sec: 220.0
+    mcp_max_tool_rounds: 10
 
     auto_run: false

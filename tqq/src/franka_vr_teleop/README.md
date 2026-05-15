@@ -6,7 +6,7 @@ The package contains:
 
 - `quest3_udp_bridge.py`: receives Quest 3 JSON packets over UDP and republishes ROS topics.
 - `VRCartesianVelocityController`: a `ros2_control` controller plugin that writes directly to Franka's official `cartesian_velocity` command interface.
-- `quest3_pose_to_twist.py`: maps Quest 3 controller motion into either the direct Cartesian velocity controller or MoveIt Servo.
+- `quest3_pose_to_twist.py`: maps Quest 3 controller motion into the direct Cartesian velocity controller.
 - `quest3_gripper_bridge.py`: maps a Quest 3 button to the Franka gripper action.
 
 Quest 3 does not need to run ROS. Send UDP packets to the PC, and the bridge will republish them as ROS topics.
@@ -54,30 +54,11 @@ Run on the real FR3:
 ros2 launch franka_vr_teleop quest3_franka_teleop.launch.py robot_ip:=192.168.22.212
 ```
 
-MoveIt Servo mode, fake hardware:
-
-```bash
-ros2 launch franka_vr_teleop quest3_franka_servo_teleop.launch.py use_fake_hardware:=true
-```
-
-MoveIt Servo mode, real FR3:
-
-```bash
-ros2 launch franka_vr_teleop quest3_franka_servo_teleop.launch.py \
-  robot_ip:=192.168.22.212 \
-  use_fake_hardware:=false
-```
-
-The original launch file is still available. The Servo launch sends Quest controller twist commands to `/servo_node/delta_twist_cmds`, then MoveIt Servo publishes joint trajectories to `/fr3_arm_controller/joint_trajectory`.
-
 Useful tuning files:
 
 ```text
 config/quest3_axis_mapping.yaml      controller axes -> FR3 base axes
 config/quest3_teleop.yaml            default direct Cartesian velocity gains
-config/quest3_servo_teleop.yaml      Quest gains used by MoveIt Servo mode
-config/fr3_moveit_servo.yaml         MoveIt Servo limits, frames, smoothing, collision checks
-config/servo_fr3_ros_controllers.yaml joint trajectory controller for Servo
 ```
 
 Hold the configured grip button to enable teleop. Trigger is mapped to the gripper action.

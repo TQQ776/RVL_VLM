@@ -45,7 +45,7 @@ target.
 ```bash
 cd ~/TQQ_ws/tqq
 source ~/TQQ_ws/setup_franka.sh
-colcon build --packages-select speech mcp --symlink-install
+colcon build --packages-select audio_dialog mcp --symlink-install
 source install/setup.bash
 ```
 
@@ -97,9 +97,9 @@ ros2 launch mcp mcp_server.launch.py \
   params_file:=/home/tqq/TQQ_ws/tqq/src/mcp/config/mcp_server.yaml
 ```
 
-Start the Qwen-Omni multimodal client. This does not use
-Whisper or FunASR; the recorded audio is sent directly to Qwen-Omni, and the
-node executes robot tools through Aliyun's official Function Calling / tools.
+Start the Qwen-Omni multimodal client. The recorded audio is sent directly to
+Qwen-Omni, and the node executes robot tools through Aliyun's official Function
+Calling / tools.
 
 The default config uses Qwen3.5 Omni Realtime:
 
@@ -148,19 +148,13 @@ ros2 launch mcp mcp_omni_client.launch.py \
   params_file:=/home/tqq/TQQ_ws/tqq/src/mcp/config/mcp_omni_client.yaml
 ```
 
-Use it the same way:
+The text/voice dialog opens automatically after startup:
 
 ```text
-Press r to start recording.
-Press q to stop recording and execute.
-```
-
-```text
-Press r to start recording.
-Press q to stop recording and execute.
-Press t to open a text chat popup. Press Ctrl+Enter to send; the answer appears
-in the same popup. Press Esc to close it.
-If the answer is still being spoken, press r to interrupt playback and start a new recording.
+Press Enter to send text, Shift+Enter to insert a newline.
+Click the record button once to start recording, then click it again to stop and execute.
+Press Esc to close the dialog.
+If the answer is still being spoken, sending the next message or starting a recording interrupts playback.
 ```
 
 Example commands:

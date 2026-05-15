@@ -29,7 +29,7 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, JointState
-from std_msgs.msg import String
+from std_msgs.msg import Header, String
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory
 
@@ -369,7 +369,7 @@ class EconomicGraspBackend:
             f'epoch={epoch}, device={self.device}'
         )
 
-    def infer(self, points: np.ndarray, colors: np.ndarray):
+    def infer(self, points: np.ndarray, colors: np.ndarray, depth_header: Optional[Header] = None):
         ok, message = self.ready()
         if not ok:
             raise RuntimeError(message)
@@ -408,7 +408,16 @@ class EconomicGraspBackend:
                 math.radians(self.node.economic_grasp_nms_rotation_thresh_deg),
             )
         gg = self._center_filter(gg, points)
-        gg = gg.sort_by_score()
+        if self.node.gripper_body_collision_filter_enabled:
+            filtered_gg = self.node._filter_gripper_body_collision_candidates(gg, points, depth_header)
+            if len(filtered_gg) > 0:
+                gg = filtered_gg
+            else:
+                self.node._publish_status(
+                    'Final gripper-body collision filter would reject all candidates; '
+                    'falling back to raw EconomicGrasp candidates and relying on staged vertical approach.'
+                )
+        gg = self._center_priority_sort(gg, points)
         if len(gg) == 0:
             raise RuntimeError('EconomicGrasp produced no valid grasp after NMS')
         return gg.best()
@@ -471,6 +480,65 @@ class EconomicGraspBackend:
         )
         return gg.filtered(keep_mask)
 
+    def _center_priority_sort(self, gg: EconomicGraspGroup, points: np.ndarray) -> EconomicGraspGroup:
+        if len(gg) == 0:
+            return gg
+        if (
+            not self.node.grasp_center_filter_enabled
+            or not self.node.grasp_center_priority_enabled
+            or len(points) == 0
+        ):
+            return gg.sort_by_score()
+
+        center = np.median(np.asarray(points, dtype=np.float64).reshape((-1, 3)), axis=0)
+        translations = gg.translations
+        offsets = np.linalg.norm(translations[:, :2] - center[:2], axis=1)
+
+        core_radius = float(self.node.grasp_center_core_radius_m)
+        if core_radius > 0.0:
+            core_mask = offsets <= core_radius
+            core_count = int(np.count_nonzero(core_mask))
+            if core_count > 0:
+                gg = gg.filtered(core_mask)
+                offsets = offsets[core_mask]
+                self.node._publish_status(
+                    'EconomicGrasp center priority kept '
+                    f'{core_count} core candidates within {core_radius:.3f}m of object center.'
+                )
+            else:
+                best_offset = float(np.min(offsets)) if offsets.size else float('nan')
+                self.node._publish_status(
+                    'EconomicGrasp center priority found no core candidate; '
+                    f'nearest candidate is {best_offset:.3f}m from object center.'
+                )
+
+        nearest_count = int(self.node.grasp_center_fallback_nearest_count)
+        if nearest_count > 0 and len(gg) > nearest_count:
+            order = np.argsort(offsets)[:nearest_count]
+            gg = EconomicGraspGroup(gg.array[order])
+            offsets = offsets[order]
+            self.node._publish_status(
+                'EconomicGrasp center priority limited final candidates to nearest '
+                f'{nearest_count} before score tie-break.'
+            )
+
+        scores = gg.scores
+        if scores.size > 0 and float(np.ptp(scores)) > 1e-9:
+            score_norm = (scores - float(np.min(scores))) / float(np.ptp(scores))
+        else:
+            score_norm = np.zeros_like(scores, dtype=np.float64)
+        center_scale = max(core_radius, 0.001)
+        center_penalty = offsets / center_scale
+        priority = center_penalty - float(self.node.grasp_center_score_weight) * score_norm
+        order = np.argsort(priority)
+        gg.array = gg.array[order]
+        best_offset = float(offsets[order[0]]) if offsets.size else float('nan')
+        self.node._publish_status(
+            'EconomicGrasp selected center-priority candidate: '
+            f'center_offset={best_offset:.3f}m, score={float(gg.scores[0]):.3f}'
+        )
+        return gg
+
 class RoiEconomicGraspController(Node):
     """Select an ROI in the camera image, estimate an EconomicGrasp 6D grasp, then execute it."""
 
@@ -495,6 +563,8 @@ class RoiEconomicGraspController(Node):
         self.latest_joint_state: Optional[JointState] = None
         self.target_class_name = ''
         self.pending_motion_speed_override: Optional[float] = None
+        self.pending_request_id = ''
+        self.pending_target_command_raw = ''
         self.last_target_command_time = 0.0
 
         self.state_lock = threading.Lock()
@@ -555,6 +625,7 @@ class RoiEconomicGraspController(Node):
         )
 
         self.status_pub = self.create_publisher(String, '~/status', 10)
+        self.grasp_result_pub = self.create_publisher(String, self.grasp_result_topic, 10)
         self.gripper_6d_pose_camera_pub = self.create_publisher(
             PoseStamped,
             '~/gripper_6d_pose_camera',
@@ -621,6 +692,7 @@ class RoiEconomicGraspController(Node):
         self.declare_parameter('joint_states_topic', '/joint_states')
         self.declare_parameter('api_detections_topic', '/mcp_omni_client/api_detections_json')
         self.declare_parameter('target_command_topic', '/economic_grasp_roi/target_class_name')
+        self.declare_parameter('grasp_result_topic', '~/grasp_result')
         self.declare_parameter('enable_api_bbox', True)
         self.declare_parameter('auto_execute_api_bbox', True)
         self.declare_parameter('api_bbox_target_timeout_sec', 5.0)
@@ -680,6 +752,18 @@ class RoiEconomicGraspController(Node):
         self.declare_parameter('economic_grasp_nms_rotation_thresh_deg', 30.0)
         self.declare_parameter('grasp_center_filter_enabled', True)
         self.declare_parameter('grasp_center_max_xy_offset_m', 0.025)
+        self.declare_parameter('grasp_center_priority_enabled', True)
+        self.declare_parameter('grasp_center_core_radius_m', 0.012)
+        self.declare_parameter('grasp_center_fallback_nearest_count', 5)
+        self.declare_parameter('grasp_center_score_weight', 0.20)
+        self.declare_parameter('gripper_body_collision_filter_enabled', True)
+        self.declare_parameter('gripper_body_collision_min_clearance_m', 0.002)
+        self.declare_parameter('gripper_body_collision_finger_width_m', 0.004)
+        self.declare_parameter('gripper_body_collision_finger_length_m', 0.000)
+        self.declare_parameter('gripper_body_collision_palm_depth_m', 0.020)
+        self.declare_parameter('gripper_body_collision_height_m', 0.004)
+        self.declare_parameter('gripper_body_collision_max_points', 12000)
+        self.declare_parameter('gripper_body_collision_allowed_points', 8)
         self.declare_parameter('economic_grasp_device', 'cuda:0')
         self.declare_parameter('economic_grasp_orientation_mode', 'economic_grasp')
         self.declare_parameter('economic_grasp_fallback_to_current_orientation', False)
@@ -721,6 +805,7 @@ class RoiEconomicGraspController(Node):
         self.joint_states_topic = str(self.get_parameter('joint_states_topic').value)
         self.api_detections_topic = str(self.get_parameter('api_detections_topic').value)
         self.target_command_topic = str(self.get_parameter('target_command_topic').value)
+        self.grasp_result_topic = str(self.get_parameter('grasp_result_topic').value)
         self.enable_api_bbox = bool(self.get_parameter('enable_api_bbox').value)
         self.auto_execute_api_bbox = bool(self.get_parameter('auto_execute_api_bbox').value)
         self.api_bbox_target_timeout_sec = float(
@@ -807,6 +892,52 @@ class RoiEconomicGraspController(Node):
         self.grasp_center_max_xy_offset_m = float(
             self.get_parameter('grasp_center_max_xy_offset_m').value
         )
+        self.grasp_center_priority_enabled = bool(
+            self.get_parameter('grasp_center_priority_enabled').value
+        )
+        self.grasp_center_core_radius_m = max(
+            0.0,
+            float(self.get_parameter('grasp_center_core_radius_m').value),
+        )
+        self.grasp_center_fallback_nearest_count = max(
+            0,
+            int(self.get_parameter('grasp_center_fallback_nearest_count').value),
+        )
+        self.grasp_center_score_weight = max(
+            0.0,
+            float(self.get_parameter('grasp_center_score_weight').value),
+        )
+        self.gripper_body_collision_filter_enabled = bool(
+            self.get_parameter('gripper_body_collision_filter_enabled').value
+        )
+        self.gripper_body_collision_min_clearance_m = max(
+            0.0,
+            float(self.get_parameter('gripper_body_collision_min_clearance_m').value),
+        )
+        self.gripper_body_collision_finger_width_m = max(
+            0.001,
+            float(self.get_parameter('gripper_body_collision_finger_width_m').value),
+        )
+        self.gripper_body_collision_finger_length_m = max(
+            0.001,
+            float(self.get_parameter('gripper_body_collision_finger_length_m').value),
+        )
+        self.gripper_body_collision_palm_depth_m = max(
+            0.001,
+            float(self.get_parameter('gripper_body_collision_palm_depth_m').value),
+        )
+        self.gripper_body_collision_height_m = max(
+            0.001,
+            float(self.get_parameter('gripper_body_collision_height_m').value),
+        )
+        self.gripper_body_collision_max_points = max(
+            100,
+            int(self.get_parameter('gripper_body_collision_max_points').value),
+        )
+        self.gripper_body_collision_allowed_points = max(
+            0,
+            int(self.get_parameter('gripper_body_collision_allowed_points').value),
+        )
         self.economic_grasp_device = str(self.get_parameter('economic_grasp_device').value)
         self.economic_grasp_orientation_mode = str(
             self.get_parameter('economic_grasp_orientation_mode').value
@@ -886,6 +1017,198 @@ class RoiEconomicGraspController(Node):
             return [value.strip()] if value.strip() else []
         return [str(item).strip() for item in value or [] if str(item).strip()]
 
+    def _filter_gripper_body_collision_candidates(
+        self,
+        gg: EconomicGraspGroup,
+        points: np.ndarray,
+        depth_header: Optional[Header] = None,
+    ) -> EconomicGraspGroup:
+        if len(gg) == 0 or len(points) == 0:
+            return gg
+        points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+        max_points = int(self.gripper_body_collision_max_points)
+        if len(points) > max_points:
+            indexes = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
+            points = points[indexes]
+
+        keep_mask = []
+        for index in range(len(gg)):
+            grasp = EconomicGraspPrediction(
+                score=gg.array[index, 0],
+                width=gg.array[index, 1],
+                height=gg.array[index, 2],
+                depth=gg.array[index, 3],
+                rotation_matrix=gg.array[index, 4:13].reshape(3, 3),
+                translation=gg.array[index, 13:16],
+                grasp_array=gg.array[index].copy(),
+            )
+            camera_pose = self._grasp_to_camera_pose(grasp, depth_header or Header())
+            if camera_pose is None:
+                keep_mask.append(False)
+                continue
+            preview_pose, execution_pose = self._collision_check_poses_for_candidate(camera_pose)
+            preview_collision_count = self._gripper_body_collision_count(
+                points,
+                preview_pose,
+                float(grasp.width),
+                float(grasp.depth),
+            )
+            execution_collision_count = self._gripper_body_collision_count(
+                points,
+                execution_pose,
+                float(grasp.width),
+                float(grasp.depth),
+            )
+            keep_mask.append(
+                preview_collision_count <= self.gripper_body_collision_allowed_points
+                and execution_collision_count <= self.gripper_body_collision_allowed_points
+            )
+
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        kept_count = int(np.count_nonzero(keep_mask))
+        rejected_count = int(len(gg) - kept_count)
+        if rejected_count > 0:
+            self._publish_status(
+                'Final gripper-body collision filter rejected '
+                f'{rejected_count}/{len(gg)} candidates before execution preview.'
+            )
+        return gg.filtered(keep_mask)
+
+    def _collision_check_poses_for_candidate(
+        self,
+        camera_pose: PoseStamped,
+    ) -> Tuple[PoseStamped, PoseStamped]:
+        try:
+            raw_base_pose = self.tf_buffer.transform(
+                camera_pose,
+                self.base_frame,
+                timeout=Duration(seconds=self.ik_timeout_sec),
+            )
+        except TransformException:
+            return copy.deepcopy(camera_pose), copy.deepcopy(camera_pose)
+
+        base_pose = copy.deepcopy(raw_base_pose)
+        base_pose.pose.position.x += self.target_offset_xyz_base[0]
+        base_pose.pose.position.y += self.target_offset_xyz_base[1]
+        base_pose.pose.position.z = max(
+            self.min_grasp_z_m,
+            base_pose.pose.position.z + self.target_offset_xyz_base[2],
+        )
+        if self.economic_grasp_orientation_mode == 'current':
+            current_orientation = self._current_end_effector_orientation()
+            if current_orientation is not None:
+                base_pose.pose.orientation = current_orientation
+        elif self.economic_grasp_orientation_mode == 'yaw_only':
+            yaw_only = self._yaw_only_orientation(base_pose.pose.orientation)
+            if yaw_only is not None:
+                base_pose.pose.orientation = yaw_only
+
+        preview_base_pose = copy.deepcopy(raw_base_pose)
+        preview_base_pose.pose.orientation = base_pose.pose.orientation
+        preview_camera_pose = self._transform_pose_or_copy(
+            preview_base_pose,
+            camera_pose.header.frame_id,
+            camera_pose,
+        )
+        execution_camera_pose = self._transform_pose_or_copy(
+            base_pose,
+            camera_pose.header.frame_id,
+            camera_pose,
+        )
+        return preview_camera_pose, execution_camera_pose
+
+    def _final_pose_gripper_body_collides(self, target: RoiEconomicGraspTarget) -> bool:
+        collision_count = self._gripper_body_collision_count(
+            target.roi_points,
+            target.preview_camera_pose,
+            target.grasp_width,
+            target.grasp_depth,
+        )
+        if collision_count > self.gripper_body_collision_allowed_points:
+            self._publish_status(
+                'ROI grasp warning: preview gripper body intersects '
+                f'{collision_count} ROI point-cloud points '
+                f'(allowed={self.gripper_body_collision_allowed_points}).'
+            )
+            return True
+        execution_collision_count = self._gripper_body_collision_count(
+            target.roi_points,
+            target.execution_camera_pose,
+            target.grasp_width,
+            target.grasp_depth,
+        )
+        if execution_collision_count > self.gripper_body_collision_allowed_points:
+            self._publish_status(
+                'ROI grasp warning: execution gripper body intersects '
+                f'{execution_collision_count} ROI point-cloud points '
+                f'(allowed={self.gripper_body_collision_allowed_points}).'
+            )
+            return True
+        return False
+
+    def _gripper_body_collision_count(
+        self,
+        points: np.ndarray,
+        pose: PoseStamped,
+        width: float,
+        depth: float,
+    ) -> int:
+        points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+        if len(points) == 0:
+            return 0
+        max_points = int(self.gripper_body_collision_max_points)
+        if len(points) > max_points:
+            indexes = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
+            points = points[indexes]
+
+        translation = np.asarray([
+            pose.pose.position.x,
+            pose.pose.position.y,
+            pose.pose.position.z,
+        ], dtype=np.float64)
+        rotation = self._quaternion_to_rotation_matrix(pose.pose.orientation)
+        gripper_rotation = rotation.dot(self._preview_mesh_axis_to_tcp_axis())
+        local = (points - translation).dot(gripper_rotation)
+
+        clearance = float(self.gripper_body_collision_min_clearance_m)
+        finger_width = float(self.gripper_body_collision_finger_width_m)
+        finger_extra_length = float(self.gripper_body_collision_finger_length_m)
+        palm_depth = float(self.gripper_body_collision_palm_depth_m)
+        height = float(self.gripper_body_collision_height_m)
+        tail_length = 0.040
+        half_height = height * 0.5 + clearance
+        half_opening = max(0.0, float(width)) * 0.5
+        grasp_depth = max(0.0, float(depth))
+
+        z_mask = (local[:, 2] >= -half_height) & (local[:, 2] <= half_height)
+
+        finger_x_min = -palm_depth - finger_width - clearance
+        finger_x_max = grasp_depth + max(0.0, finger_extra_length) + clearance
+        finger_x_mask = (local[:, 0] >= finger_x_min) & (local[:, 0] <= finger_x_max)
+        left_y_min = -half_opening - finger_width - clearance
+        left_y_max = -half_opening
+        right_y_min = half_opening
+        right_y_max = half_opening + finger_width + clearance
+        left_finger = finger_x_mask & (local[:, 1] >= left_y_min) & (local[:, 1] <= left_y_max)
+        right_finger = finger_x_mask & (local[:, 1] >= right_y_min) & (local[:, 1] <= right_y_max)
+
+        palm_x_min = -palm_depth - finger_width - clearance
+        palm_x_max = -palm_depth + clearance
+        palm_y_min = -half_opening - clearance
+        palm_y_max = half_opening + clearance
+        palm_x_mask = (local[:, 0] >= palm_x_min) & (local[:, 0] <= palm_x_max)
+        palm = palm_x_mask & (local[:, 1] >= palm_y_min) & (local[:, 1] <= palm_y_max)
+
+        tail_x_min = -tail_length - finger_width - palm_depth - clearance
+        tail_x_max = -finger_width - palm_depth + clearance
+        tail_y_min = -0.5 * finger_width - clearance
+        tail_y_max = 0.5 * finger_width + clearance
+        tail_x_mask = (local[:, 0] >= tail_x_min) & (local[:, 0] <= tail_x_max)
+        tail = tail_x_mask & (local[:, 1] >= tail_y_min) & (local[:, 1] <= tail_y_max)
+
+        collision_mask = z_mask & (left_finger | right_finger | palm | tail)
+        return int(np.count_nonzero(collision_mask))
+
     def color_callback(self, msg: Image) -> None:
         try:
             color = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
@@ -916,10 +1239,12 @@ class RoiEconomicGraspController(Node):
             self.latest_joint_state = copy.deepcopy(msg)
 
     def target_command_callback(self, msg: String) -> None:
-        target_name, motion_speed = self._parse_target_command(msg.data)
+        target_name, motion_speed, request_id = self._parse_target_command(msg.data)
         with self.state_lock:
             self.target_class_name = target_name
             self.pending_motion_speed_override = motion_speed
+            self.pending_request_id = request_id
+            self.pending_target_command_raw = str(msg.data or '')
             self.last_target_command_time = time.monotonic() if target_name else 0.0
         if target_name:
             speed_text = (
@@ -927,11 +1252,15 @@ class RoiEconomicGraspController(Node):
                 if motion_speed is not None
                 else ''
             )
+            request_text = f'; request_id={request_id}' if request_id else ''
             self._publish_status(
-                f'API bbox target command received: {target_name}{speed_text}; '
+                f'API bbox target command received: {target_name}{speed_text}{request_text}; '
                 'waiting for matching API detection.'
             )
         else:
+            with self.state_lock:
+                self.pending_request_id = ''
+                self.pending_target_command_raw = ''
             self._publish_status('API bbox target command cleared.')
 
     def api_detections_callback(self, msg: String) -> None:
@@ -949,6 +1278,7 @@ class RoiEconomicGraspController(Node):
             target_name = self.target_class_name.strip()
             target_time = self.last_target_command_time
             motion_speed = self.pending_motion_speed_override
+            request_id = self.pending_request_id
         if not target_name:
             return
         if (
@@ -966,25 +1296,27 @@ class RoiEconomicGraspController(Node):
         roi = self._roi_from_api_detection(detection)
         if roi is None:
             return
-        started = self._start_api_roi(roi, detection, motion_speed)
+        started = self._start_api_roi(roi, detection, motion_speed, request_id)
         if started:
             with self.state_lock:
                 self.pending_motion_speed_override = None
+                self.pending_request_id = ''
 
-    def _parse_target_command(self, raw_text: str) -> Tuple[str, Optional[float]]:
+    def _parse_target_command(self, raw_text: str) -> Tuple[str, Optional[float], str]:
         text = str(raw_text or '').strip()
         if not text:
-            return '', None
+            return '', None, ''
         if not text.startswith('{'):
-            return text, None
+            return text, None, ''
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            return text, None
+            return text, None, ''
         if not isinstance(data, dict):
-            return text, None
+            return text, None, ''
         name = str(data.get('name') or data.get('object_name') or data.get('target') or '').strip()
-        return name, self._optional_motion_speed(data)
+        request_id = str(data.get('request_id') or '').strip()
+        return name, self._optional_motion_speed(data), request_id
 
     @staticmethod
     def _optional_motion_speed(data: Dict) -> Optional[float]:
@@ -1029,10 +1361,21 @@ class RoiEconomicGraspController(Node):
         roi: RoiSelection,
         detection: Dict,
         motion_speed: Optional[float],
+        request_id: str = '',
     ) -> bool:
         with self.ui_lock:
             if self.worker_running:
-                self._publish_status('API bbox ignored: EconomicGrasp worker is already running.')
+                message = 'API bbox ignored: EconomicGrasp worker is already running.'
+                self._publish_status(message)
+                if request_id:
+                    self._publish_grasp_result(
+                        request_id=request_id,
+                        success=False,
+                        message=message,
+                        source='api_bbox',
+                        class_name=str(detection.get('class_name', '')).strip(),
+                        stage='busy',
+                    )
                 return False
             self.selected_roi = copy.deepcopy(roi)
             self.worker_running = True
@@ -1044,7 +1387,7 @@ class RoiEconomicGraspController(Node):
         )
         thread = threading.Thread(
             target=self._roi_worker,
-            args=(roi, 'api_bbox', motion_speed),
+            args=(roi, 'api_bbox', motion_speed, request_id, class_name),
             daemon=True,
         )
         thread.start()
@@ -1166,10 +1509,17 @@ class RoiEconomicGraspController(Node):
         roi: RoiSelection,
         source: str = 'manual_roi',
         motion_speed: Optional[float] = None,
+        request_id: str = '',
+        class_name: str = '',
     ) -> None:
+        success = False
+        result_message = 'ROI grasp did not finish.'
+        stage = 'unknown'
         try:
             target = self._build_grasp_target(roi, source=source)
             if target is None:
+                stage = 'target_generation_failed'
+                result_message = 'ROI EconomicGrasp target generation failed.'
                 return
             self.gripper_6d_pose_camera_pub.publish(target.preview_camera_pose)
             self.gripper_6d_pose_base_pub.publish(target.base_pose)
@@ -1182,18 +1532,40 @@ class RoiEconomicGraspController(Node):
             self._publish_gripper_6d_status(target)
             should_execute = self.auto_execute_api_bbox if source == 'api_bbox' else True
             if should_execute and not self._preview_and_confirm(target):
-                self._publish_status('ROI grasp canceled before motion; gripper will not close.')
+                stage = 'preview_canceled'
+                result_message = 'ROI grasp canceled before motion; gripper will not close.'
+                self._publish_status(result_message)
                 return
             if not should_execute:
-                self._publish_status('ROI EconomicGrasp target generated without execution.')
+                stage = 'target_generated'
+                result_message = 'ROI EconomicGrasp target generated without execution.'
+                self._publish_status(result_message)
                 return
             with self._temporary_motion_speed(motion_speed):
                 moved = self._execute_grasp_motion(target.base_pose)
             if moved:
-                self._close_gripper_for_grasp()
+                gripper_closed = self._close_gripper_for_grasp()
+                success = bool(gripper_closed)
+                stage = 'completed' if gripper_closed else 'gripper_failed'
+                result_message = (
+                    'ROI EconomicGrasp motion completed and gripper closed.'
+                    if gripper_closed
+                    else 'ROI EconomicGrasp motion completed, but gripper close failed.'
+                )
             else:
-                self._publish_status('ROI grasp motion did not report success; gripper will not close.')
+                stage = 'motion_failed'
+                result_message = 'ROI grasp motion did not report success; gripper will not close.'
+                self._publish_status(result_message)
         finally:
+            if request_id:
+                self._publish_grasp_result(
+                    request_id=request_id,
+                    success=success,
+                    message=result_message,
+                    source=source,
+                    class_name=class_name,
+                    stage=stage,
+                )
             with self.ui_lock:
                 self.worker_running = False
 
@@ -1217,7 +1589,7 @@ class RoiEconomicGraspController(Node):
         if points is None or colors is None:
             return None
         try:
-            grasp = self.backend.infer(points, colors)
+            grasp = self.backend.infer(points, colors, depth_header)
         except Exception as exc:
             self.get_logger().error(f'EconomicGrasp inference failed: {exc}')
             self._publish_status(f'EconomicGrasp inference failed: {exc}')
@@ -1268,7 +1640,7 @@ class RoiEconomicGraspController(Node):
             camera_pose.header.frame_id,
             camera_pose,
         )
-        return RoiEconomicGraspTarget(
+        target = RoiEconomicGraspTarget(
             roi=roi,
             grasp_score=float(grasp.score),
             grasp_width=float(grasp.width),
@@ -1282,6 +1654,9 @@ class RoiEconomicGraspController(Node):
             roi_colors=colors.astype(np.float32, copy=False),
             orientation_source=orientation_source,
         )
+        if self.gripper_body_collision_filter_enabled:
+            self._final_pose_gripper_body_collides(target)
+        return target
 
     def _preview_and_confirm(self, target: RoiEconomicGraspTarget) -> bool:
         if self.popup_preview_before_execute:
@@ -2317,6 +2692,30 @@ class RoiEconomicGraspController(Node):
     def _publish_status(self, message: str) -> None:
         self.status_pub.publish(String(data=message))
         self.get_logger().info(message)
+
+    def _publish_grasp_result(
+        self,
+        request_id: str,
+        success: bool,
+        message: str,
+        source: str,
+        class_name: str,
+        stage: str,
+    ) -> None:
+        payload = {
+            'request_id': str(request_id or ''),
+            'success': bool(success),
+            'message': str(message or ''),
+            'source': str(source or ''),
+            'class_name': str(class_name or ''),
+            'stage': str(stage or ''),
+            'stamp': time.time(),
+        }
+        self.grasp_result_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+        self._publish_status(
+            f'ROI grasp result request_id={payload["request_id"]} '
+            f'success={payload["success"]} stage={payload["stage"]}: {payload["message"]}'
+        )
 
     def destroy_node(self):
         self.shutdown_event.set()

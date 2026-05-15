@@ -61,7 +61,6 @@ install(PROGRAMS
   scripts/quest3_pose_to_twist.py
   scripts/quest3_gripper_bridge.py
   scripts/quest3_udp_bridge.py
-  scripts/start_moveit_servo.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

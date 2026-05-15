@@ -23,14 +23,8 @@ def _launch_setup(context):
         'omni_speech_style',
         'omni_native_audio_output_enabled',
         'omni_native_audio_fallback_to_local_tts',
-        'vision_image_topic',
-        'vision_show_window',
-        'vision_window_name',
-        'vision_save_images',
-        'vision_output_dir',
-        'vision_result_hold_sec',
-        'api_detections_topic',
-        'target_command_topic',
+        'list_tools_service',
+        'call_tool_service',
     ):
         value = LaunchConfiguration(name).perform(context).strip()
         if value:
@@ -44,6 +38,7 @@ def _launch_setup(context):
             'stop_record_key': LaunchConfiguration('stop_record_key'),
             'text_popup_enabled': LaunchConfiguration('text_popup_enabled'),
             'text_popup_key': LaunchConfiguration('text_popup_key'),
+            'text_popup_auto_open': LaunchConfiguration('text_popup_auto_open'),
             'tts_engine': LaunchConfiguration('tts_engine'),
             'audio_device': LaunchConfiguration('audio_device'),
         },
@@ -69,11 +64,12 @@ def generate_launch_description():
 
     args = [
         DeclareLaunchArgument('params_file', default_value=default_params),
-        DeclareLaunchArgument('push_to_talk_enabled', default_value='true'),
+        DeclareLaunchArgument('push_to_talk_enabled', default_value='false'),
         DeclareLaunchArgument('push_to_talk_key', default_value='r'),
         DeclareLaunchArgument('stop_record_key', default_value='q'),
         DeclareLaunchArgument('text_popup_enabled', default_value='true'),
         DeclareLaunchArgument('text_popup_key', default_value='t'),
+        DeclareLaunchArgument('text_popup_auto_open', default_value='true'),
         DeclareLaunchArgument('tts_engine', default_value='auto'),
         DeclareLaunchArgument('audio_device', default_value='default'),
         DeclareLaunchArgument('omni_api_key_env', default_value=''),
@@ -88,14 +84,8 @@ def generate_launch_description():
         DeclareLaunchArgument('omni_speech_style', default_value=''),
         DeclareLaunchArgument('omni_native_audio_output_enabled', default_value=''),
         DeclareLaunchArgument('omni_native_audio_fallback_to_local_tts', default_value=''),
-        DeclareLaunchArgument('vision_image_topic', default_value=''),
-        DeclareLaunchArgument('vision_show_window', default_value=''),
-        DeclareLaunchArgument('vision_window_name', default_value=''),
-        DeclareLaunchArgument('vision_save_images', default_value=''),
-        DeclareLaunchArgument('vision_output_dir', default_value=''),
-        DeclareLaunchArgument('vision_result_hold_sec', default_value=''),
-        DeclareLaunchArgument('api_detections_topic', default_value=''),
-        DeclareLaunchArgument('target_command_topic', default_value=''),
+        DeclareLaunchArgument('list_tools_service', default_value=''),
+        DeclareLaunchArgument('call_tool_service', default_value=''),
     ]
 
     return LaunchDescription(args + [OpaqueFunction(function=_launch_setup)])

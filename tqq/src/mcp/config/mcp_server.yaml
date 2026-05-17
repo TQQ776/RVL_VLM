@@ -10,7 +10,7 @@
       - fr3_joint5
       - fr3_joint6
       - fr3_joint7
-    home_joint_positions_deg: [74.0, -3.0, -7.0, -115.0, -1.0, 110.0, 22.0]
+    home_joint_positions_deg: [73.505, -5.778, -7.259, -106.012, 0.397, 100.862, 20.455]
     home_move_duration_sec: 4.0
     home_trajectory_dt_sec: 0.05
     home_trajectory_start_delay_sec: 0.1
@@ -21,7 +21,9 @@
     move_group_name: fr3_arm
     ik_service: /compute_ik
     cartesian_path_service: /compute_cartesian_path
+    apply_planning_scene_service: /apply_planning_scene
     move_group_action: /move_action
+    move_group_planner_id: ''
     execution_mode: move_group
     axis_move_execution_mode: cartesian
     plan_only: false
@@ -30,9 +32,25 @@
     ik_timeout_sec: 0.5
     service_wait_timeout_sec: 5.0
     action_wait_timeout_sec: 10.0
+    move_group_result_timeout_scale: 2.0
+    execute_trajectory_action: /execute_trajectory
+    # MoveIt is still used for planning and collision checking, but executing
+    # the selected trajectory directly through the arm controller avoids
+    # intermittent ExecuteTrajectory "Goal was rejected by server" failures.
+    move_group_execution_backend: controller
     motion_duration_sec: 4.0
     max_single_axis_move_cm: 10.0
     goal_joint_tolerance: 0.01
+    # Reject MoveIt plans that swing joints too far from the current state.
+    # Joint 7 is wrist roll, so it is ignored by this guard.
+    # 1.0472 rad ~= 60 deg per checked joint; 4.18879 rad ~= 240 deg total over checked joints.
+    max_moveit_joint_delta_rad: 1.0471975511965976
+    max_moveit_total_joint_delta_rad: 4.1887902047863905
+    # Ask MoveIt for several alternative plans and execute the one with the
+    # smallest checked joint motion that still passes the guard.
+    moveit_guard_plan_retries: 3
+    moveit_joint_delta_guard_ignore_joints:
+      - fr3_joint7
     max_velocity_scaling: 0.05
     max_acceleration_scaling: 0.05
     num_planning_attempts: 5
@@ -63,16 +81,10 @@
     # grasp failure after contact and the fingers may stop holding force.
     gripper_grasp_epsilon_outer_m: 0.08
 
-    # YOLO/object-target bridge. The actual pixel/depth/TF/MoveIt target
-    # pipeline is handled by control/object_target_controller.
-    detected_objects_topic: /object_target_controller/detected_objects
-    target_command_topic: /object_target_controller/target_class_name
+    # API-vision/EconomicGrasp bridge. The server publishes Qwen-Omni
+    # detections and a one-shot target command for roi_economic_grasp_controller.
+    target_command_topic: /economic_grasp_roi/target_class_name
     api_detections_topic: /mcp_omni_client/api_detections_json
-    yolo_detect_once_service: /yolo/detect_once
-    yolo_detection_wait_timeout_sec: 5.0
-    target_command_settle_sec: 0.3
-    detected_objects_max_age_sec: 2.0
-    require_detected_before_grab: true
     require_target_command_subscriber: true
 
     # Server-side MCP tools. The client only asks the LLM which tool to call;
@@ -86,18 +98,21 @@
 
     vision_enabled: true
     vision_image_topic: /camera/camera/color/image_raw
+    vision_depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    vision_camera_info_topic: /camera/camera/color/camera_info
+    vision_tf_wait_timeout_sec: 10.0
     vision_max_image_width: 0
     vision_jpeg_quality: 85
     vision_image_max_age_sec: 30.0
     vision_show_window: true
-    vision_window_name: Qwen-Omni Vision Box
+    vision_window_name: 千问视觉检测框
     vision_save_images: true
     vision_output_dir: /home/tqq/TQQ_ws/omni_vision_outputs
     vision_result_hold_sec: 60.0
 
     api_detection_default_confidence: 0.90
     api_detection_publish_settle_sec: 0.25
-    api_detection_republish_count: 3
+    api_detection_republish_count: 1
     api_detection_republish_interval_sec: 0.15
     # Qwen-Omni/VLM boxes are commonly returned in a 0-1000 visual coordinate space.
     api_detection_box_coordinate_space: qwen_1000
@@ -106,3 +121,79 @@
     grasp_result_topic: /economic_grasp_roi/grasp_result
     grab_api_wait_for_result: true
     grab_api_result_timeout_sec: 180.0
+
+    # Scene memory is refreshed when API vision detects boxes. It stores the
+    # detected object's bbox plus an estimated 3D base-frame point from aligned
+    # depth, so place actions can still use the remembered reference object
+    # after the wrist camera moves away from the original view.
+    scene_memory_max_age_sec: 1800.0
+    scene_memory_depth_percentile: 35.0
+    scene_memory_depth_margin_m: 0.08
+    scene_memory_min_depth_m: 0.05
+    scene_memory_max_depth_m: 3.0
+    scene_memory_erode_px: 2
+
+    # Unified place sequence: lift while holding, optionally return home, plan to
+    # the target's vertical pre-place pose, single-axis Z descend, then open.
+    place_lift_m: 0.03
+    place_lift_avoid_collisions: false
+    place_transfer_via_home: true
+    place_pre_height_m: 0.10
+    place_descend_m: 0.08
+    place_descend_min_fraction: 0.95
+    place_default_offset_cm: 5.0
+    place_target_z_offset_m: 0.0
+    place_move_duration_sec: 4.0
+    place_max_velocity_scaling: 0.05
+    place_max_acceleration_scaling: 0.05
+    # Place transfer still uses MoveIt/MoveGroup collision-aware planning.
+    # Multiple attempts let MoveIt return the shortest solution among attempts.
+    place_move_group_planner_id: RRTConnectkConfigDefault
+    place_num_planning_attempts: 12
+    place_allowed_planning_time_sec: 8.0
+    place_goal_position_tolerance_m: 0.005
+    place_goal_orientation_tolerance_rad: 0.05
+
+    # Open-top container model for commands such as "把苹果放到箱子里".
+    # Real box: 30cm x 22cm x 14cm, real wall thickness about 0.5cm.
+    # Collision wall thickness is intentionally inflated to 1.5cm for safety.
+    container_length_x_m: 0.30
+    container_width_y_m: 0.22
+    container_height_m: 0.14
+    container_wall_thickness_m: 0.015
+    container_bottom_thickness_m: 0.015
+    container_collision_z_offset_m: 0.0
+    container_planning_scene_wait_timeout_sec: 2.0
+
+    # Apply visible MoveIt/RViz collision models immediately after camera
+    # detection. Keep planning-scene collisions limited to the container and
+    # the static right arm; fruits/QR/cups/etc. remain scene memory only.
+    scene_collision_auto_apply: true
+    scene_collision_show_fruits: false
+    scene_collision_show_containers: true
+    scene_collision_show_other_objects: false
+    scene_collision_show_static_right_arm: true
+    static_right_arm_offset_xyz_m: [0.92, 0.0, 0.0]
+    static_right_arm_joint_positions_deg: [74.0, -3.0, -7.0, -115.0, -1.0, 110.0, 22.0]
+    static_right_arm_collision_padding_m: 0.03
+    static_right_arm_marker_base_id: 1800000
+    scene_collision_preview_sec: 0.75
+    scene_collision_clear_previous: true
+    scene_markers_topic: ~/scene_markers
+    scene_markers_enabled: true
+    object_collision_padding_m: 0.005
+    object_collision_min_size_m: 0.03
+    object_collision_max_size_m: 0.20
+    held_object_collision_enabled: false
+    held_object_link_name: fr3_hand_tcp
+    held_object_touch_links:
+      - fr3_hand
+      - fr3_leftfinger
+      - fr3_rightfinger
+      - fr3_hand_tcp
+    held_object_offset_xyz_tcp: [0.0, 0.0, 0.04]
+    held_object_padding_m: 0.0
+    held_object_min_radius_m: 0.035
+    held_object_max_radius_m: 0.06
+    held_object_default_radius_m: 0.05
+    fruit_collision_box_long_ratio: 1.8

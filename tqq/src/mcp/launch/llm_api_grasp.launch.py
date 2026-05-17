@@ -13,6 +13,7 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogI
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -41,6 +42,8 @@ def generate_launch_description():
     launch_control = LaunchConfiguration('launch_control')
     launch_mcp_server = LaunchConfiguration('launch_mcp_server')
     launch_omni_client = LaunchConfiguration('launch_omni_client')
+    launch_aux_camera = LaunchConfiguration('launch_aux_camera')
+    launch_aux_camera_view = LaunchConfiguration('launch_aux_camera_view')
 
     args = [
         DeclareLaunchArgument('robot_ip', default_value='192.168.22.212'),
@@ -52,6 +55,15 @@ def generate_launch_description():
             default_value='327122079035',
             description='RealSense serial number for the hand-mounted D435i camera.',
         ),
+        DeclareLaunchArgument('aux_camera_namespace', default_value='d435'),
+        DeclareLaunchArgument('aux_camera_name', default_value='d435'),
+        DeclareLaunchArgument(
+            'aux_camera_serial_no',
+            default_value='327122070172',
+            description='RealSense serial number for the auxiliary D435 camera.',
+        ),
+        DeclareLaunchArgument('aux_camera_view_topic', default_value='/d435/d435/color/image_raw'),
+        DeclareLaunchArgument('aux_camera_view_window_name', default_value='全局相机视野'),
         DeclareLaunchArgument('image_topic', default_value='/camera/camera/color/image_raw'),
         DeclareLaunchArgument('depth_topic', default_value='/camera/camera/aligned_depth_to_color/image_raw'),
         DeclareLaunchArgument('camera_info_topic', default_value='/camera/camera/color/camera_info'),
@@ -82,6 +94,8 @@ def generate_launch_description():
         DeclareLaunchArgument('vision_save_images', default_value=''),
         DeclareLaunchArgument('vision_output_dir', default_value=''),
         DeclareLaunchArgument('launch_camera', default_value='true'),
+        DeclareLaunchArgument('launch_aux_camera', default_value='true'),
+        DeclareLaunchArgument('launch_aux_camera_view', default_value='true'),
         DeclareLaunchArgument('launch_moveit', default_value='true'),
         DeclareLaunchArgument('launch_handeye', default_value='true'),
         DeclareLaunchArgument('launch_control', default_value='true'),
@@ -99,6 +113,30 @@ def generate_launch_description():
             'params_file': LaunchConfiguration('realsense_params_file'),
         },
         IfCondition(launch_camera),
+    )
+
+    aux_camera = _include(
+        'franka_camera',
+        'realsense.launch.py',
+        {
+            'camera_namespace': LaunchConfiguration('aux_camera_namespace'),
+            'camera_name': LaunchConfiguration('aux_camera_name'),
+            'serial_no': LaunchConfiguration('aux_camera_serial_no'),
+            'params_file': LaunchConfiguration('realsense_params_file'),
+        },
+        IfCondition(launch_aux_camera),
+    )
+
+    aux_camera_view = Node(
+        package='mcp',
+        executable='camera_viewer',
+        name='global_camera_view',
+        parameters=[{
+            'image_topic': LaunchConfiguration('aux_camera_view_topic'),
+            'window_name': LaunchConfiguration('aux_camera_view_window_name'),
+        }],
+        output='screen',
+        condition=IfCondition(launch_aux_camera_view),
     )
 
     moveit = _include(
@@ -172,6 +210,8 @@ def generate_launch_description():
         + [
             LogInfo(msg='Starting LLM + API-vision grasp stack. Make sure DASHSCOPE_API_KEY is exported before using the Omni client.'),
             camera,
+            aux_camera,
+            _delayed(4.0, aux_camera_view),
             _delayed(1.0, moveit),
             _delayed(5.0, handeye),
             _delayed(7.0, economic_grasp),

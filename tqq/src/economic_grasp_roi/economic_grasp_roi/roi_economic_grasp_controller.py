@@ -31,9 +31,14 @@ from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, JointState
 from std_msgs.msg import Header, String
 from tf2_ros import Buffer, TransformException, TransformListener
-from trajectory_msgs.msg import JointTrajectory
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 import tf2_geometry_msgs  # noqa: F401  Registers geometry message transforms.
+
+try:
+    from mcp.srv import MoveAxis
+except ImportError:
+    MoveAxis = None
 
 
 @dataclass
@@ -369,7 +374,12 @@ class EconomicGraspBackend:
             f'epoch={epoch}, device={self.device}'
         )
 
-    def infer(self, points: np.ndarray, colors: np.ndarray, depth_header: Optional[Header] = None):
+    def infer(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+        depth_header: Optional[Header] = None,
+    ):
         ok, message = self.ready()
         if not ok:
             raise RuntimeError(message)
@@ -407,7 +417,6 @@ class EconomicGraspBackend:
                 self.node.economic_grasp_nms_translation_thresh,
                 math.radians(self.node.economic_grasp_nms_rotation_thresh_deg),
             )
-        gg = self._center_filter(gg, points)
         if self.node.gripper_body_collision_filter_enabled:
             filtered_gg = self.node._filter_gripper_body_collision_candidates(gg, points, depth_header)
             if len(filtered_gg) > 0:
@@ -417,6 +426,7 @@ class EconomicGraspBackend:
                     'Final gripper-body collision filter would reject all candidates; '
                     'falling back to raw EconomicGrasp candidates and relying on staged vertical approach.'
                 )
+        gg = self._center_filter(gg, points)
         gg = self._center_priority_sort(gg, points)
         if len(gg) == 0:
             raise RuntimeError('EconomicGrasp produced no valid grasp after NMS')
@@ -564,8 +574,10 @@ class RoiEconomicGraspController(Node):
         self.target_class_name = ''
         self.pending_motion_speed_override: Optional[float] = None
         self.pending_request_id = ''
+        self.active_request_id = ''
         self.pending_target_command_raw = ''
         self.last_target_command_time = 0.0
+        self.last_motion_failure = ''
 
         self.state_lock = threading.Lock()
         self.ui_lock = threading.Lock()
@@ -575,6 +587,9 @@ class RoiEconomicGraspController(Node):
         self.selected_roi: Optional[RoiSelection] = None
         self.worker_running = False
         self.shutdown_event = threading.Event()
+        self._emergency_stop_requested = threading.Event()
+        self._active_goal_lock = threading.Lock()
+        self._active_goal_handles: Dict[str, object] = {}
 
         image_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -623,6 +638,13 @@ class RoiEconomicGraspController(Node):
             10,
             callback_group=self.callback_group,
         )
+        self.create_subscription(
+            String,
+            self.emergency_stop_topic,
+            self.emergency_stop_callback,
+            10,
+            callback_group=self.callback_group,
+        )
 
         self.status_pub = self.create_publisher(String, '~/status', 10)
         self.grasp_result_pub = self.create_publisher(String, self.grasp_result_topic, 10)
@@ -652,6 +674,17 @@ class RoiEconomicGraspController(Node):
             self.cartesian_path_service,
             callback_group=self.callback_group,
         )
+        self.move_z_client = None
+        if MoveAxis is not None:
+            self.move_z_client = self.create_client(
+                MoveAxis,
+                self.move_z_service,
+                callback_group=self.callback_group,
+            )
+        else:
+            self.get_logger().warn(
+                'mcp.srv.MoveAxis is not available; single-axis ROI grasp descend cannot run.'
+            )
         self.trajectory_client = ActionClient(
             self,
             FollowJointTrajectory,
@@ -671,8 +704,10 @@ class RoiEconomicGraspController(Node):
             for action_name in self.gripper_grasp_actions
         ]
 
-        self.ui_thread = threading.Thread(target=self._ui_loop, daemon=True)
-        self.ui_thread.start()
+        self.ui_thread = None
+        if self.roi_window_enabled:
+            self.ui_thread = threading.Thread(target=self._ui_loop, daemon=True)
+            self.ui_thread.start()
 
         self.get_logger().info(
             'ROI EconomicGrasp controller ready. '
@@ -681,7 +716,7 @@ class RoiEconomicGraspController(Node):
             f'api_bbox={self.enable_api_bbox}'
         )
         self._publish_status(
-            'ROI EconomicGrasp ready: drag a rectangle manually, or publish an API bbox '
+            'ROI EconomicGrasp ready: publish an API bbox '
             f'to {self.api_detections_topic} and target to {self.target_command_topic}.'
         )
 
@@ -692,6 +727,7 @@ class RoiEconomicGraspController(Node):
         self.declare_parameter('joint_states_topic', '/joint_states')
         self.declare_parameter('api_detections_topic', '/mcp_omni_client/api_detections_json')
         self.declare_parameter('target_command_topic', '/economic_grasp_roi/target_class_name')
+        self.declare_parameter('emergency_stop_topic', '/mcp/emergency_stop')
         self.declare_parameter('grasp_result_topic', '~/grasp_result')
         self.declare_parameter('enable_api_bbox', True)
         self.declare_parameter('auto_execute_api_bbox', True)
@@ -706,15 +742,21 @@ class RoiEconomicGraspController(Node):
         self.declare_parameter('move_group_name', 'fr3_arm')
         self.declare_parameter('ik_service', '/compute_ik')
         self.declare_parameter('cartesian_path_service', '/compute_cartesian_path')
+        self.declare_parameter('move_z_service', '/mcp_server/move_z_cm')
+        self.declare_parameter('use_move_z_service_for_descend', True)
         self.declare_parameter('move_group_action', '/move_action')
         self.declare_parameter('trajectory_action', '/fr3_arm_controller/follow_joint_trajectory')
         self.declare_parameter('plan_only', False)
         self.declare_parameter('avoid_collisions', True)
         self.declare_parameter('ik_timeout_sec', 0.5)
+        self.declare_parameter('tf_wait_timeout_sec', 10.0)
         self.declare_parameter('service_wait_timeout_sec', 5.0)
         self.declare_parameter('action_wait_timeout_sec', 10.0)
         self.declare_parameter('move_group_result_timeout_sec', 90.0)
         self.declare_parameter('goal_joint_tolerance', 0.01)
+        self.declare_parameter('max_moveit_joint_delta_rad', 1.0471975511965976)
+        self.declare_parameter('max_moveit_total_joint_delta_rad', 4.1887902047863905)
+        self.declare_parameter('moveit_joint_delta_guard_ignore_joints', ['fr3_joint7'])
         self.declare_parameter('max_velocity_scaling', 0.01)
         self.declare_parameter('max_acceleration_scaling', 0.01)
         self.declare_parameter('num_planning_attempts', 5)
@@ -726,7 +768,8 @@ class RoiEconomicGraspController(Node):
         self.declare_parameter('cartesian_jump_threshold', 0.0)
         self.declare_parameter('cartesian_min_fraction', 0.95)
         self.declare_parameter('cartesian_descend_duration_sec', 4.0)
-        self.declare_parameter('roi_window_name', 'EconomicGrasp ROI Selector')
+        self.declare_parameter('roi_window_enabled', False)
+        self.declare_parameter('roi_window_name', '抓取检测框')
         self.declare_parameter('roi_padding_px', 8)
         self.declare_parameter('depth_unit_scale', 0.001)
         self.declare_parameter('min_depth_m', 0.05)
@@ -771,7 +814,7 @@ class RoiEconomicGraspController(Node):
         self.declare_parameter('economic_grasp_tcp_offset_xyz_grasp', [0.0, 0.0, 0.0])
         self.declare_parameter('target_offset_xyz_base', [0.0, 0.0, -0.02])
         self.declare_parameter('min_grasp_z_m', -10.0)
-        self.declare_parameter('popup_preview_before_execute', True)
+        self.declare_parameter('popup_preview_before_execute', False)
         self.declare_parameter('popup_preview_require_confirmation', False)
         self.declare_parameter('popup_preview_max_points', 20000)
         self.declare_parameter('popup_preview_frame_size_m', 0.08)
@@ -805,6 +848,7 @@ class RoiEconomicGraspController(Node):
         self.joint_states_topic = str(self.get_parameter('joint_states_topic').value)
         self.api_detections_topic = str(self.get_parameter('api_detections_topic').value)
         self.target_command_topic = str(self.get_parameter('target_command_topic').value)
+        self.emergency_stop_topic = str(self.get_parameter('emergency_stop_topic').value)
         self.grasp_result_topic = str(self.get_parameter('grasp_result_topic').value)
         self.enable_api_bbox = bool(self.get_parameter('enable_api_bbox').value)
         self.auto_execute_api_bbox = bool(self.get_parameter('auto_execute_api_bbox').value)
@@ -825,17 +869,36 @@ class RoiEconomicGraspController(Node):
         self.move_group_name = str(self.get_parameter('move_group_name').value)
         self.ik_service = str(self.get_parameter('ik_service').value)
         self.cartesian_path_service = str(self.get_parameter('cartesian_path_service').value)
+        self.move_z_service = str(self.get_parameter('move_z_service').value)
+        self.use_move_z_service_for_descend = bool(
+            self.get_parameter('use_move_z_service_for_descend').value
+        )
         self.move_group_action = str(self.get_parameter('move_group_action').value)
         self.trajectory_action = str(self.get_parameter('trajectory_action').value)
         self.plan_only = bool(self.get_parameter('plan_only').value)
         self.avoid_collisions = bool(self.get_parameter('avoid_collisions').value)
         self.ik_timeout_sec = float(self.get_parameter('ik_timeout_sec').value)
+        self.tf_wait_timeout_sec = max(
+            self.ik_timeout_sec,
+            float(self.get_parameter('tf_wait_timeout_sec').value),
+        )
         self.service_wait_timeout_sec = float(self.get_parameter('service_wait_timeout_sec').value)
         self.action_wait_timeout_sec = float(self.get_parameter('action_wait_timeout_sec').value)
         self.move_group_result_timeout_sec = float(
             self.get_parameter('move_group_result_timeout_sec').value
         )
         self.goal_joint_tolerance = float(self.get_parameter('goal_joint_tolerance').value)
+        self.max_moveit_joint_delta_rad = max(
+            0.0,
+            float(self.get_parameter('max_moveit_joint_delta_rad').value),
+        )
+        self.max_moveit_total_joint_delta_rad = max(
+            0.0,
+            float(self.get_parameter('max_moveit_total_joint_delta_rad').value),
+        )
+        self.moveit_joint_delta_guard_ignore_joints = set(
+            self._string_list(self.get_parameter('moveit_joint_delta_guard_ignore_joints').value)
+        )
         self.max_velocity_scaling = float(self.get_parameter('max_velocity_scaling').value)
         self.max_acceleration_scaling = float(self.get_parameter('max_acceleration_scaling').value)
         self.num_planning_attempts = int(self.get_parameter('num_planning_attempts').value)
@@ -853,6 +916,7 @@ class RoiEconomicGraspController(Node):
             0.1,
             float(self.get_parameter('cartesian_descend_duration_sec').value),
         )
+        self.roi_window_enabled = bool(self.get_parameter('roi_window_enabled').value)
         self.roi_window_name = str(self.get_parameter('roi_window_name').value)
         self.roi_padding_px = max(0, int(self.get_parameter('roi_padding_px').value))
         self.depth_unit_scale = float(self.get_parameter('depth_unit_scale').value)
@@ -1073,6 +1137,104 @@ class RoiEconomicGraspController(Node):
                 f'{rejected_count}/{len(gg)} candidates before execution preview.'
             )
         return gg.filtered(keep_mask)
+
+    def _gripper_body_local_boxes(self, width: float, depth: float) -> List[Tuple[np.ndarray, np.ndarray]]:
+        clearance = float(self.gripper_body_collision_min_clearance_m)
+        finger_width = float(self.gripper_body_collision_finger_width_m)
+        finger_extra_length = float(self.gripper_body_collision_finger_length_m)
+        palm_depth = float(self.gripper_body_collision_palm_depth_m)
+        height = float(self.gripper_body_collision_height_m)
+        tail_length = 0.040
+        half_height = height * 0.5 + clearance
+        half_opening = max(0.0, float(width)) * 0.5
+        grasp_depth = max(0.0, float(depth))
+
+        finger_x_min = -palm_depth - finger_width - clearance
+        finger_x_max = grasp_depth + max(0.0, finger_extra_length) + clearance
+        left_y_min = -half_opening - finger_width - clearance
+        left_y_max = -half_opening
+        right_y_min = half_opening
+        right_y_max = half_opening + finger_width + clearance
+        palm_x_min = -palm_depth - finger_width - clearance
+        palm_x_max = -palm_depth + clearance
+        palm_y_min = -half_opening - clearance
+        palm_y_max = half_opening + clearance
+        tail_x_min = -tail_length - finger_width - palm_depth - clearance
+        tail_x_max = -finger_width - palm_depth + clearance
+        tail_y_min = -0.5 * finger_width - clearance
+        tail_y_max = 0.5 * finger_width + clearance
+
+        ranges = [
+            ((finger_x_min, finger_x_max), (left_y_min, left_y_max), (-half_height, half_height)),
+            ((finger_x_min, finger_x_max), (right_y_min, right_y_max), (-half_height, half_height)),
+            ((palm_x_min, palm_x_max), (palm_y_min, palm_y_max), (-half_height, half_height)),
+            ((tail_x_min, tail_x_max), (tail_y_min, tail_y_max), (-half_height, half_height)),
+        ]
+        boxes = []
+        for x_range, y_range, z_range in ranges:
+            if x_range[1] <= x_range[0] or y_range[1] <= y_range[0] or z_range[1] <= z_range[0]:
+                continue
+            center = np.asarray([
+                (x_range[0] + x_range[1]) * 0.5,
+                (y_range[0] + y_range[1]) * 0.5,
+                (z_range[0] + z_range[1]) * 0.5,
+            ], dtype=np.float64)
+            half_extents = np.asarray([
+                (x_range[1] - x_range[0]) * 0.5,
+                (y_range[1] - y_range[0]) * 0.5,
+                (z_range[1] - z_range[0]) * 0.5,
+            ], dtype=np.float64)
+            boxes.append((center, half_extents))
+        return boxes
+
+    @staticmethod
+    def _obb_intersects_aabb(
+        obb_center: np.ndarray,
+        obb_axes: np.ndarray,
+        obb_half_extents: np.ndarray,
+        aabb_center: np.ndarray,
+        aabb_half_extents: np.ndarray,
+    ) -> bool:
+        axes = np.asarray(obb_axes, dtype=np.float64).reshape(3, 3)
+        axes = axes / np.maximum(np.linalg.norm(axes, axis=0, keepdims=True), 1e-9)
+        obb_half = np.asarray(obb_half_extents, dtype=np.float64).reshape(3)
+        aabb_half = np.asarray(aabb_half_extents, dtype=np.float64).reshape(3)
+        rotation = axes.T
+        abs_rotation = np.abs(rotation) + 1e-9
+        translation = axes.T.dot(
+            np.asarray(aabb_center, dtype=np.float64).reshape(3)
+            - np.asarray(obb_center, dtype=np.float64).reshape(3)
+        )
+
+        for i in range(3):
+            ra = obb_half[i]
+            rb = float(np.dot(aabb_half, abs_rotation[i, :]))
+            if abs(translation[i]) > ra + rb:
+                return False
+
+        for j in range(3):
+            ra = float(np.dot(obb_half, abs_rotation[:, j]))
+            rb = aabb_half[j]
+            if abs(float(np.dot(translation, rotation[:, j]))) > ra + rb:
+                return False
+
+        for i in range(3):
+            for j in range(3):
+                ra = (
+                    obb_half[(i + 1) % 3] * abs_rotation[(i + 2) % 3, j]
+                    + obb_half[(i + 2) % 3] * abs_rotation[(i + 1) % 3, j]
+                )
+                rb = (
+                    aabb_half[(j + 1) % 3] * abs_rotation[i, (j + 2) % 3]
+                    + aabb_half[(j + 2) % 3] * abs_rotation[i, (j + 1) % 3]
+                )
+                value = abs(
+                    translation[(i + 2) % 3] * rotation[(i + 1) % 3, j]
+                    - translation[(i + 1) % 3] * rotation[(i + 2) % 3, j]
+                )
+                if value > ra + rb:
+                    return False
+        return True
 
     def _collision_check_poses_for_candidate(
         self,
@@ -1299,8 +1461,18 @@ class RoiEconomicGraspController(Node):
         started = self._start_api_roi(roi, detection, motion_speed, request_id)
         if started:
             with self.state_lock:
+                self.target_class_name = ''
                 self.pending_motion_speed_override = None
                 self.pending_request_id = ''
+                self.pending_target_command_raw = ''
+                self.last_target_command_time = 0.0
+
+    def emergency_stop_callback(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data or '{}')
+        except json.JSONDecodeError:
+            payload = {'raw': msg.data}
+        self._request_emergency_stop(payload)
 
     def _parse_target_command(self, raw_text: str) -> Tuple[str, Optional[float], str]:
         text = str(raw_text or '').strip()
@@ -1365,7 +1537,8 @@ class RoiEconomicGraspController(Node):
     ) -> bool:
         with self.ui_lock:
             if self.worker_running:
-                message = 'API bbox ignored: EconomicGrasp worker is already running.'
+                active_text = f' active_request_id={self.active_request_id}' if self.active_request_id else ''
+                message = f'API bbox ignored: EconomicGrasp worker is already running.{active_text}'
                 self._publish_status(message)
                 if request_id:
                     self._publish_grasp_result(
@@ -1379,6 +1552,7 @@ class RoiEconomicGraspController(Node):
                 return False
             self.selected_roi = copy.deepcopy(roi)
             self.worker_running = True
+            self.active_request_id = str(request_id or '')
         class_name = str(detection.get('class_name', '')).strip() or 'object'
         confidence = float(detection.get('confidence', 0.0))
         self._publish_status(
@@ -1387,7 +1561,13 @@ class RoiEconomicGraspController(Node):
         )
         thread = threading.Thread(
             target=self._roi_worker,
-            args=(roi, 'api_bbox', motion_speed, request_id, class_name),
+            args=(
+                roi,
+                'api_bbox',
+                motion_speed,
+                request_id,
+                class_name,
+            ),
             daemon=True,
         )
         thread.start()
@@ -1465,17 +1645,17 @@ class RoiEconomicGraspController(Node):
             color = (255, 200, 0)
         if roi is not None:
             cv2.rectangle(display, (roi.x0, roi.y0), (roi.x1, roi.y1), color, 2)
-        status = 'running EconomicGrasp...' if worker_running else 'drag ROI, Enter/g run, c clear, q close'
-        cv2.putText(
-            display,
-            status,
-            (12, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0) if worker_running else (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+        if worker_running:
+            cv2.putText(
+                display,
+                'running EconomicGrasp...',
+                (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
         return display
 
     @staticmethod
@@ -1516,6 +1696,11 @@ class RoiEconomicGraspController(Node):
         result_message = 'ROI grasp did not finish.'
         stage = 'unknown'
         try:
+            if self._emergency_stop_requested.is_set():
+                stage = 'emergency_stop'
+                result_message = 'ROI grasp skipped because emergency stop is active.'
+                self._publish_status(result_message)
+                return
             target = self._build_grasp_target(roi, source=source)
             if target is None:
                 stage = 'target_generation_failed'
@@ -1541,9 +1726,19 @@ class RoiEconomicGraspController(Node):
                 result_message = 'ROI EconomicGrasp target generated without execution.'
                 self._publish_status(result_message)
                 return
+            if self._emergency_stop_requested.is_set():
+                stage = 'emergency_stop'
+                result_message = 'ROI grasp stopped before motion because emergency stop is active.'
+                self._publish_status(result_message)
+                return
             with self._temporary_motion_speed(motion_speed):
                 moved = self._execute_grasp_motion(target.base_pose)
             if moved:
+                if self._emergency_stop_requested.is_set():
+                    stage = 'emergency_stop'
+                    result_message = 'ROI grasp stopped before gripper close because emergency stop is active.'
+                    self._publish_status(result_message)
+                    return
                 gripper_closed = self._close_gripper_for_grasp()
                 success = bool(gripper_closed)
                 stage = 'completed' if gripper_closed else 'gripper_failed'
@@ -1554,7 +1749,12 @@ class RoiEconomicGraspController(Node):
                 )
             else:
                 stage = 'motion_failed'
-                result_message = 'ROI grasp motion did not report success; gripper will not close.'
+                detail = self._last_motion_failure()
+                result_message = (
+                    f'ROI grasp motion failed at {detail}; gripper will not close.'
+                    if detail
+                    else 'ROI grasp motion did not report success; gripper will not close.'
+                )
                 self._publish_status(result_message)
         finally:
             if request_id:
@@ -1568,6 +1768,7 @@ class RoiEconomicGraspController(Node):
                 )
             with self.ui_lock:
                 self.worker_running = False
+                self.active_request_id = ''
 
     def _build_grasp_target(
         self,
@@ -1597,11 +1798,17 @@ class RoiEconomicGraspController(Node):
         camera_pose = self._grasp_to_camera_pose(grasp, depth_header)
         if camera_pose is None:
             return None
+        if not self._wait_for_transform(
+            self.base_frame,
+            camera_pose.header.frame_id,
+            'EconomicGrasp pose',
+        ):
+            return None
         try:
             raw_base_pose = self.tf_buffer.transform(
                 camera_pose,
                 self.base_frame,
-                timeout=Duration(seconds=self.ik_timeout_sec),
+                timeout=Duration(seconds=self.tf_wait_timeout_sec),
             )
         except TransformException as exc:
             self.get_logger().error(
@@ -2154,6 +2361,35 @@ class RoiEconomicGraspController(Node):
         pose.pose.orientation = self._rotation_matrix_to_quaternion(tcp_rotation)
         return pose
 
+    def _wait_for_transform(self, target_frame: str, source_frame: str, label: str) -> bool:
+        target_frame = str(target_frame or '').strip()
+        source_frame = str(source_frame or '').strip()
+        if not target_frame or not source_frame:
+            return False
+        deadline = time.monotonic() + max(0.1, self.tf_wait_timeout_sec)
+        last_error = ''
+        while rclpy.ok() and not self.shutdown_event.is_set():
+            try:
+                self.tf_buffer.lookup_transform(
+                    target_frame,
+                    source_frame,
+                    Time(),
+                    timeout=Duration(seconds=max(0.1, self.ik_timeout_sec)),
+                )
+                return True
+            except TransformException as exc:
+                last_error = str(exc)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        message = (
+            f'Cannot transform {label} {source_frame} -> {target_frame} '
+            f'after waiting {self.tf_wait_timeout_sec:.1f}s: {last_error}'
+        )
+        self.get_logger().error(message)
+        self._publish_status(message)
+        return False
+
     def _current_end_effector_orientation(self) -> Optional[Quaternion]:
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -2201,6 +2437,11 @@ class RoiEconomicGraspController(Node):
             return copy.deepcopy(fallback_pose)
 
     def _execute_grasp_motion(self, final_pose: PoseStamped) -> bool:
+        self._set_motion_failure('')
+        if self._emergency_stop_requested.is_set():
+            self._set_motion_failure('emergency stop is active before ROI grasp motion')
+            self._publish_status('ROI grasp motion skipped because emergency stop is active.')
+            return False
         if not self.staged_grasp_enabled:
             return self._execute_pose_motion(final_pose, 'roi economic_grasp target')
 
@@ -2222,25 +2463,81 @@ class RoiEconomicGraspController(Node):
             f'({self.pre_grasp_lift_m:.3f}m above final pose)'
         )
         if not self._execute_pose_motion(pre_grasp_pose, 'roi economic_grasp pre-grasp'):
+            if not self._last_motion_failure():
+                self._set_motion_failure('pre-grasp MoveGroup motion')
             return False
 
         self._publish_status(
-            'staged ROI grasp step 2/2: Cartesian descend along base -Z '
+            'staged ROI grasp step 2/2: single-axis move_z descend along base -Z '
             f'{self.cartesian_descend_m:.3f}m to z={descend_pose.pose.position.z:.3f}m'
         )
-        return self._execute_cartesian_descend(descend_pose)
+        return self._execute_descend(descend_pose)
+
+    def _execute_descend(self, target_pose: PoseStamped) -> bool:
+        if self.use_move_z_service_for_descend:
+            return self._execute_move_z_service_descend(self.cartesian_descend_m)
+        return self._execute_cartesian_descend(target_pose)
+
+    def _execute_move_z_service_descend(self, descend_m: float) -> bool:
+        if self.plan_only:
+            self._set_motion_failure('single-axis move_z descend skipped because plan_only=true')
+            self._publish_status('plan_only=true; skipping single-axis move_z descend execution.')
+            return False
+        if self._emergency_stop_requested.is_set():
+            self._set_motion_failure('single-axis move_z descend skipped because emergency stop is active')
+            self._publish_status('single-axis move_z descend skipped because emergency stop is active.')
+            return False
+        if self.move_z_client is None:
+            self._set_motion_failure('single-axis move_z service client is unavailable')
+            return False
+        if not self.move_z_client.wait_for_service(timeout_sec=self.service_wait_timeout_sec):
+            message = f'single-axis move_z service not available: {self.move_z_service}'
+            self._set_motion_failure(message)
+            self.get_logger().warn(message)
+            return False
+
+        request = MoveAxis.Request()
+        request.centimeters = -100.0 * max(0.0, float(descend_m))
+        self._publish_status(
+            f'calling {self.move_z_service} for ROI grasp descend: {request.centimeters:.2f} cm'
+        )
+        future = self.move_z_client.call_async(request)
+        response = self._wait_for_future(
+            future,
+            self.service_wait_timeout_sec + self.cartesian_descend_duration_sec + self.action_wait_timeout_sec,
+            'single-axis move_z descend',
+        )
+        if response is None:
+            self._set_motion_failure('single-axis move_z descend service timed out')
+            return False
+        if response.success:
+            self._publish_status(f'single-axis move_z descend succeeded: {response.message}')
+            return True
+        message = f'single-axis move_z descend failed: {response.message}'
+        self._set_motion_failure(message)
+        self.get_logger().error(message)
+        return False
 
     def _execute_cartesian_descend(self, target_pose: PoseStamped) -> bool:
         if self.plan_only:
+            self._set_motion_failure('Cartesian descend skipped because plan_only=true')
             self._publish_status('plan_only=true; skipping Cartesian descend execution.')
             return False
+        if self._emergency_stop_requested.is_set():
+            self._set_motion_failure('Cartesian descend skipped because emergency stop is active')
+            self._publish_status('Cartesian descend skipped because emergency stop is active.')
+            return False
         if not self.cartesian_path_client.wait_for_service(timeout_sec=self.service_wait_timeout_sec):
-            self.get_logger().error(f'Cartesian path service not available: {self.cartesian_path_service}')
+            message = f'Cartesian path service not available: {self.cartesian_path_service}'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return False
         with self.state_lock:
             joint_state = copy.deepcopy(self.latest_joint_state)
         if joint_state is None:
-            self.get_logger().error('No /joint_states received; cannot compute Cartesian descend.')
+            message = 'No /joint_states received; cannot compute Cartesian descend.'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return False
 
         request = GetCartesianPath.Request()
@@ -2262,21 +2559,26 @@ class RoiEconomicGraspController(Node):
             'ROI Cartesian descend path',
         )
         if response is None:
+            self._set_motion_failure('Cartesian descend path service timed out')
             return False
         if response.error_code.val != MoveItErrorCodes.SUCCESS:
-            self.get_logger().error(
-                f'Cartesian descend path failed with code {response.error_code.val}'
-            )
+            message = f'Cartesian descend path failed with code {response.error_code.val}'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return False
         if response.fraction < self.cartesian_min_fraction:
-            self.get_logger().error(
+            message = (
                 f'Cartesian descend path incomplete: fraction={response.fraction:.3f}, '
                 f'required={self.cartesian_min_fraction:.3f}'
             )
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return False
         trajectory = response.solution.joint_trajectory
         if not trajectory.points:
-            self.get_logger().error('Cartesian descend path returned an empty trajectory.')
+            message = 'Cartesian descend path returned an empty trajectory.'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return False
 
         self._time_parameterize_cartesian_trajectory(
@@ -2290,6 +2592,10 @@ class RoiEconomicGraspController(Node):
         )
 
     def _execute_pose_motion(self, target_pose: PoseStamped, label: str) -> bool:
+        if self._emergency_stop_requested.is_set():
+            self._set_motion_failure(f'{label} skipped because emergency stop is active')
+            self._publish_status(f'{label} skipped because emergency stop is active.')
+            return False
         motion_label = label
         joint_goal = self._compute_ik(target_pose, motion_label)
         if (
@@ -2309,17 +2615,26 @@ class RoiEconomicGraspController(Node):
                 if joint_goal is not None:
                     motion_label = fallback_label
         if joint_goal is None:
+            if not self._last_motion_failure():
+                self._set_motion_failure(f'IK failed for {label}')
             return False
         return self._execute_with_move_group(joint_goal, motion_label)
 
     def _compute_ik(self, target_pose: PoseStamped, label: str) -> Optional[Dict[str, float]]:
+        if self._emergency_stop_requested.is_set():
+            self._set_motion_failure(f'IK skipped for {label} because emergency stop is active')
+            return None
         if not self.ik_client.wait_for_service(timeout_sec=self.service_wait_timeout_sec):
-            self.get_logger().error(f'IK service not available: {self.ik_service}')
+            message = f'IK service not available: {self.ik_service}'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return None
         with self.state_lock:
             joint_state = copy.deepcopy(self.latest_joint_state)
         if joint_state is None:
-            self.get_logger().error('No /joint_states received; cannot seed MoveIt IK.')
+            message = 'No /joint_states received; cannot seed MoveIt IK.'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return None
 
         request = GetPositionIK.Request()
@@ -2337,27 +2652,46 @@ class RoiEconomicGraspController(Node):
             'IK response',
         )
         if response is None:
+            self._set_motion_failure(f'IK response timed out for {label}')
             return None
         if response.error_code.val != MoveItErrorCodes.SUCCESS:
-            self.get_logger().error(
-                f'MoveIt IK failed for {label} with code {response.error_code.val}'
-            )
+            message = f'MoveIt IK failed for {label} with code {response.error_code.val}'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return None
         positions = dict(zip(response.solution.joint_state.name, response.solution.joint_state.position))
         missing = [name for name in self.arm_joints if name not in positions]
         if missing:
-            self.get_logger().error(f'IK solution missing joints: {missing}')
+            message = f'IK solution missing joints: {missing}'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return None
         joint_goal = {name: float(positions[name]) for name in self.arm_joints}
         self._publish_status(f'IK solved: {self._format_joint_goal(joint_goal)}')
         return joint_goal
 
     def _execute_with_move_group(self, joint_goal: Dict[str, float], label: str) -> bool:
+        if self._emergency_stop_requested.is_set():
+            self._set_motion_failure(f'{label} skipped because emergency stop is active')
+            self._publish_status(f'{label} skipped because emergency stop is active.')
+            return False
         if not self.move_group_client.wait_for_server(timeout_sec=self.action_wait_timeout_sec):
-            self.get_logger().error(f'MoveGroup action not available: {self.move_group_action}')
+            message = f'MoveGroup action not available: {self.move_group_action}'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return False
         with self.state_lock:
             joint_state = copy.deepcopy(self.latest_joint_state)
+        ok, guard_message = self._joint_goal_within_moveit_limits(
+            joint_goal,
+            joint_state,
+            f'{label} joint goal',
+        )
+        if not ok:
+            self._set_motion_failure(guard_message)
+            self.get_logger().warn(guard_message)
+            self._publish_status(guard_message)
+            return False
         goal = MoveGroup.Goal()
         goal.request.group_name = self.move_group_name
         goal.request.num_planning_attempts = self.num_planning_attempts
@@ -2377,31 +2711,96 @@ class RoiEconomicGraspController(Node):
             f'acceleration_scaling={self.max_acceleration_scaling:.3f}, '
             f'result_timeout={self.move_group_result_timeout_sec:.1f}s'
         )
+        if not self.plan_only:
+            plan_ok, plan_message, planned_trajectory = self._plan_move_group_goal_for_guard(
+                goal,
+                label,
+            )
+            if not plan_ok:
+                self._set_motion_failure(plan_message)
+                self.get_logger().error(plan_message)
+                return False
+            ok, guard_message = self._trajectory_within_moveit_limits(
+                planned_trajectory,
+                f'{label} planned trajectory',
+            )
+            if not ok:
+                self._set_motion_failure(guard_message)
+                self.get_logger().warn(guard_message)
+                self._publish_status(guard_message)
+                return False
+            return self._execute_joint_trajectory(
+                planned_trajectory,
+                f'{label} guarded MoveGroup trajectory',
+                self.move_group_result_timeout_sec,
+            )
+
         send_future = self.move_group_client.send_goal_async(goal)
         goal_handle = self._wait_for_future(send_future, self.action_wait_timeout_sec, 'MoveGroup goal')
         if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().error('MoveGroup goal failed or was rejected.')
+            message = f'MoveGroup goal failed or was rejected for {label}.'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return False
+        self._register_active_goal(f'{label} MoveGroup', goal_handle)
         result_future = goal_handle.get_result_async()
         action_result = self._wait_for_future(
             result_future,
             self.move_group_result_timeout_sec,
             'MoveGroup result',
         )
+        self._unregister_active_goal(f'{label} MoveGroup', goal_handle)
         if action_result is None:
             if self._joint_goal_reached(joint_goal):
                 self._publish_status(
                     f'MoveGroup result timed out for {label}, but joint state is within tolerance.'
                 )
                 return True
+            self._set_motion_failure(f'MoveGroup result timed out for {label}')
             return False
         result = action_result.result
         if result.error_code.val == MoveItErrorCodes.SUCCESS:
             mode = 'planned' if self.plan_only else 'planned and executed'
             self._publish_status(f'MoveGroup {mode} {label} successfully.')
             return True
-        self.get_logger().error(f'MoveGroup failed for {label} with code {result.error_code.val}')
+        message = f'MoveGroup failed for {label} with code {result.error_code.val}'
+        self._set_motion_failure(message)
+        self.get_logger().error(message)
         return False
+
+    def _plan_move_group_goal_for_guard(
+        self,
+        goal: MoveGroup.Goal,
+        label: str,
+    ) -> Tuple[bool, str, JointTrajectory]:
+        if self._emergency_stop_requested.is_set():
+            return False, f'MoveGroup guard plan skipped for {label}: emergency stop is active.', JointTrajectory()
+        plan_goal = copy.deepcopy(goal)
+        plan_goal.planning_options.plan_only = True
+        send_future = self.move_group_client.send_goal_async(plan_goal)
+        goal_handle = self._wait_for_future(
+            send_future,
+            self.action_wait_timeout_sec,
+            f'{label} guard plan goal',
+        )
+        if goal_handle is None or not goal_handle.accepted:
+            return False, f'MoveGroup guard plan goal failed or was rejected for {label}.', JointTrajectory()
+        self._register_active_goal(f'{label} guard plan', goal_handle)
+        action_result = self._wait_for_future(
+            goal_handle.get_result_async(),
+            self.move_group_result_timeout_sec,
+            f'{label} guard plan result',
+        )
+        self._unregister_active_goal(f'{label} guard plan', goal_handle)
+        if action_result is None:
+            return False, f'MoveGroup guard plan timed out for {label}.', JointTrajectory()
+        result = action_result.result
+        if result.error_code.val != MoveItErrorCodes.SUCCESS:
+            return False, f'MoveGroup guard plan failed for {label} with code {result.error_code.val}', JointTrajectory()
+        trajectory = result.planned_trajectory.joint_trajectory
+        if not trajectory.points:
+            return False, f'MoveGroup guard plan returned an empty trajectory for {label}.', JointTrajectory()
+        return True, f'MoveGroup guard plan accepted for {label}.', copy.deepcopy(trajectory)
 
     def _time_parameterize_cartesian_trajectory(
         self,
@@ -2439,8 +2838,21 @@ class RoiEconomicGraspController(Node):
         label: str,
         timeout_sec: float,
     ) -> bool:
+        if self._emergency_stop_requested.is_set():
+            self._set_motion_failure(f'{label} skipped because emergency stop is active')
+            self._publish_status(f'{label} skipped because emergency stop is active.')
+            return False
         if not self.trajectory_client.wait_for_server(timeout_sec=self.action_wait_timeout_sec):
-            self.get_logger().error(f'Trajectory action not available: {self.trajectory_action}')
+            message = f'Trajectory action not available: {self.trajectory_action}'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
+            return False
+
+        ok, guard_message = self._trajectory_within_moveit_limits(trajectory, label)
+        if not ok:
+            self._set_motion_failure(guard_message)
+            self.get_logger().warn(guard_message)
+            self._publish_status(guard_message)
             return False
 
         goal = FollowJointTrajectory.Goal()
@@ -2455,8 +2867,11 @@ class RoiEconomicGraspController(Node):
             f'{label} trajectory goal',
         )
         if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().error(f'Trajectory controller rejected {label}.')
+            message = f'Trajectory controller rejected {label}.'
+            self._set_motion_failure(message)
+            self.get_logger().error(message)
             return False
+        self._register_active_goal(f'{label} trajectory', goal_handle)
 
         result_future = goal_handle.get_result_async()
         action_result = self._wait_for_future(
@@ -2464,7 +2879,9 @@ class RoiEconomicGraspController(Node):
             timeout_sec,
             f'{label} trajectory result',
         )
+        self._unregister_active_goal(f'{label} trajectory', goal_handle)
         if action_result is None:
+            self._set_motion_failure(f'Trajectory result timed out for {label}')
             return False
 
         result = action_result.result
@@ -2472,12 +2889,15 @@ class RoiEconomicGraspController(Node):
             self._publish_status(f'Cartesian trajectory {label} executed successfully.')
             return True
 
-        self.get_logger().error(
-            f'Trajectory failed for {label}: {result.error_code} {result.error_string}'
-        )
+        message = f'Trajectory failed for {label}: {result.error_code} {result.error_string}'
+        self._set_motion_failure(message)
+        self.get_logger().error(message)
         return False
 
     def _close_gripper_for_grasp(self) -> bool:
+        if self._emergency_stop_requested.is_set():
+            self._publish_status('gripper close skipped because emergency stop is active.')
+            return False
         client_name, client = self._available_gripper_grasp_client()
         if client is None:
             self.get_logger().error('No gripper grasp action available.')
@@ -2500,12 +2920,14 @@ class RoiEconomicGraspController(Node):
         )
         if goal_handle is None or not goal_handle.accepted:
             return False
+        self._register_active_goal(f'gripper grasp {client_name}', goal_handle)
         result_future = goal_handle.get_result_async()
         action_result = self._wait_for_future(
             result_future,
             self.gripper_action_timeout_sec,
             'gripper grasp result',
         )
+        self._unregister_active_goal(f'gripper grasp {client_name}', goal_handle)
         if action_result is None:
             return False
         result = action_result.result
@@ -2514,6 +2936,103 @@ class RoiEconomicGraspController(Node):
             return True
         self.get_logger().error(f'Gripper grasp failed: {result.error}')
         return False
+
+    def _set_motion_failure(self, message: str) -> None:
+        with self.state_lock:
+            self.last_motion_failure = str(message or '').strip()
+
+    def _last_motion_failure(self) -> str:
+        with self.state_lock:
+            return str(self.last_motion_failure or '').strip()
+
+    def _register_active_goal(self, label: str, goal_handle) -> None:
+        if goal_handle is None:
+            return
+        key = f'{label}:{id(goal_handle)}'
+        with self._active_goal_lock:
+            self._active_goal_handles[key] = goal_handle
+
+    def _unregister_active_goal(self, label: str, goal_handle) -> None:
+        if goal_handle is None:
+            return
+        key = f'{label}:{id(goal_handle)}'
+        with self._active_goal_lock:
+            self._active_goal_handles.pop(key, None)
+
+    def _request_emergency_stop(self, payload: Optional[Dict] = None) -> None:
+        self._emergency_stop_requested.set()
+        try:
+            self._publish_status(
+                'EMERGENCY_STOP received: canceling ROI grasp action goals and holding current arm pose'
+            )
+            self._set_motion_failure('emergency stop requested')
+            canceled = self._cancel_active_goals(timeout_sec=1.0)
+            hold_ok, hold_message = self._send_hold_current_position(timeout_sec=1.0)
+            source = ''
+            if isinstance(payload, dict):
+                source = str(payload.get('source') or '').strip()
+            source_text = f' source={source}' if source else ''
+            self._publish_status(
+                f'ROI emergency stop handled:{source_text} cancel_requests={canceled}; '
+                f'hold_current_position={"sent" if hold_ok else "not sent"} ({hold_message})'
+            )
+        finally:
+            time.sleep(0.25)
+            self._emergency_stop_requested.clear()
+            self._publish_status('ROI emergency stop reset: ready for the next command')
+
+    def _cancel_active_goals(self, timeout_sec: float = 1.0) -> int:
+        with self._active_goal_lock:
+            items = list(self._active_goal_handles.items())
+            self._active_goal_handles.clear()
+        canceled = 0
+        for label, goal_handle in items:
+            try:
+                future = goal_handle.cancel_goal_async()
+            except Exception as exc:
+                self.get_logger().warn(f'Failed to request cancel for {label}: {exc}')
+                continue
+            event = threading.Event()
+            future.add_done_callback(lambda _: event.set())
+            event.wait(timeout=max(0.05, float(timeout_sec)))
+            canceled += 1
+        return canceled
+
+    def _send_hold_current_position(self, timeout_sec: float = 1.0) -> Tuple[bool, str]:
+        with self.state_lock:
+            joint_state = copy.deepcopy(self.latest_joint_state)
+        if joint_state is None:
+            return False, 'no /joint_states available'
+        positions = dict(zip(joint_state.name, joint_state.position))
+        if not all(name in positions for name in self.arm_joints):
+            return False, 'current joint state is incomplete'
+        if not self.trajectory_client.wait_for_server(timeout_sec=max(0.05, timeout_sec)):
+            return False, f'trajectory action unavailable: {self.trajectory_action}'
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = JointTrajectory()
+        goal.trajectory.header.stamp = self.get_clock().now().to_msg()
+        goal.trajectory.joint_names = list(self.arm_joints)
+        point = JointTrajectoryPoint()
+        point.positions = [float(positions[name]) for name in self.arm_joints]
+        point.velocities = [0.0 for _ in self.arm_joints]
+        point.accelerations = [0.0 for _ in self.arm_joints]
+        point.time_from_start = self._duration_msg(0.05)
+        goal.trajectory.points = [point]
+        goal.goal_time_tolerance = self._duration_msg(0.1)
+
+        send_future = self.trajectory_client.send_goal_async(goal)
+        event = threading.Event()
+        send_future.add_done_callback(lambda _: event.set())
+        if not event.wait(timeout=max(0.05, float(timeout_sec))):
+            return False, 'timed out sending hold trajectory'
+        try:
+            goal_handle = send_future.result()
+        except Exception as exc:
+            return False, f'hold trajectory send failed: {exc}'
+        if goal_handle is None or not goal_handle.accepted:
+            return False, 'hold trajectory rejected'
+        return True, 'hold trajectory accepted'
 
     def _available_gripper_grasp_client(self):
         for action_name, client in self.gripper_grasp_clients:
@@ -2532,6 +3051,104 @@ class RoiEconomicGraspController(Node):
             return False
         tolerance = max(0.001, self.goal_joint_tolerance)
         return all(abs(float(positions[name]) - float(joint_goal[name])) <= tolerance for name in self.arm_joints)
+
+    def _joint_goal_within_moveit_limits(
+        self,
+        joint_goal: Dict[str, float],
+        joint_state: Optional[JointState],
+        label: str,
+    ) -> Tuple[bool, str]:
+        if joint_state is None:
+            return False, f'{label} rejected: no /joint_states for joint delta guard'
+        trajectory = JointTrajectory()
+        trajectory.joint_names = list(self.arm_joints)
+        point = JointTrajectoryPoint()
+        point.positions = [float(joint_goal[name]) for name in self.arm_joints]
+        trajectory.points = [point]
+        return self._trajectory_within_moveit_limits(trajectory, label, joint_state=joint_state)
+
+    def _trajectory_within_moveit_limits(
+        self,
+        trajectory: JointTrajectory,
+        label: str,
+        joint_state: Optional[JointState] = None,
+    ) -> Tuple[bool, str]:
+        if self.max_moveit_joint_delta_rad <= 0.0 and self.max_moveit_total_joint_delta_rad <= 0.0:
+            return True, f'{label}: joint delta guard disabled'
+        if joint_state is None:
+            with self.state_lock:
+                joint_state = copy.deepcopy(self.latest_joint_state)
+        if joint_state is None:
+            return False, f'{label} rejected: no /joint_states for joint delta guard'
+        current = dict(zip(joint_state.name, joint_state.position))
+        names = list(trajectory.joint_names) or list(self.arm_joints)
+        ignored = set(getattr(self, 'moveit_joint_delta_guard_ignore_joints', set()))
+        checked_indexes = [(index, name) for index, name in enumerate(names) if name not in ignored]
+        if not checked_indexes:
+            return True, f'{label}: all trajectory joints ignored by joint delta guard'
+        missing = [name for _, name in checked_indexes if name not in current]
+        if missing:
+            return False, f'{label} rejected: current joint state missing {missing}'
+        start = {name: float(current[name]) for _, name in checked_indexes}
+        max_joint_delta = 0.0
+        max_joint_name = ''
+        max_total_delta = 0.0
+        max_total_deltas: List[Tuple[str, float]] = []
+        for point in trajectory.points:
+            positions = list(point.positions)
+            if len(positions) < len(names):
+                return False, f'{label} rejected: trajectory point has incomplete positions'
+            deltas_by_name = [
+                (name, abs(self._angle_delta(float(positions[index]), start[name])))
+                for index, name in checked_indexes
+            ]
+            deltas = [delta for _, delta in deltas_by_name]
+            if not deltas:
+                continue
+            local_max = max(deltas)
+            if local_max > max_joint_delta:
+                max_joint_delta = local_max
+                max_joint_name = checked_indexes[deltas.index(local_max)][1]
+            local_total = sum(deltas)
+            if local_total > max_total_delta:
+                max_total_delta = local_total
+                max_total_deltas = deltas_by_name
+        if (
+            self.max_moveit_joint_delta_rad > 0.0
+            and max_joint_delta > self.max_moveit_joint_delta_rad
+        ):
+            return False, (
+                f'{label} rejected: joint {max_joint_name} delta '
+                f'{math.degrees(max_joint_delta):.1f}deg exceeds limit '
+                f'{math.degrees(self.max_moveit_joint_delta_rad):.1f}deg'
+            )
+        if (
+            self.max_moveit_total_joint_delta_rad > 0.0
+            and max_total_delta > self.max_moveit_total_joint_delta_rad
+        ):
+            top_deltas = self._format_joint_delta_summary(max_total_deltas)
+            return False, (
+                f'{label} rejected: total joint delta '
+                f'{math.degrees(max_total_delta):.1f}deg exceeds limit '
+                f'{math.degrees(self.max_moveit_total_joint_delta_rad):.1f}deg'
+                f'{top_deltas}'
+            )
+        return True, (
+            f'{label} accepted: max_joint_delta={math.degrees(max_joint_delta):.1f}deg, '
+            f'total_joint_delta={math.degrees(max_total_delta):.1f}deg'
+        )
+
+    @staticmethod
+    def _format_joint_delta_summary(deltas_by_name: List[Tuple[str, float]], limit: int = 4) -> str:
+        if not deltas_by_name:
+            return ''
+        top = sorted(deltas_by_name, key=lambda item: item[1], reverse=True)[:limit]
+        summary = ', '.join(f'{name}={math.degrees(delta):.1f}deg' for name, delta in top)
+        return f'; largest checked joint deltas: {summary}'
+
+    @staticmethod
+    def _angle_delta(target: float, start: float) -> float:
+        return math.atan2(math.sin(target - start), math.cos(target - start))
 
     def _temporary_motion_speed(self, speed: Optional[float]):
         return _TemporaryMotionSpeed(self, speed)
@@ -2667,7 +3284,16 @@ class RoiEconomicGraspController(Node):
     def _wait_for_future(self, future, timeout_sec: float, label: str):
         event = threading.Event()
         future.add_done_callback(lambda _: event.set())
-        if not event.wait(timeout=max(0.1, timeout_sec)):
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        while not event.is_set():
+            if self.shutdown_event.is_set() or self._emergency_stop_requested.is_set() or not rclpy.ok():
+                self.get_logger().warn(f'Interrupted while waiting for {label}; stop requested.')
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            event.wait(timeout=min(0.1, remaining))
+        if not event.is_set():
             self.get_logger().error(f'Timed out waiting for {label}.')
             return None
         try:

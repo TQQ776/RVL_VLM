@@ -41,8 +41,8 @@ Visualization Manager:
       Reference Frame: <Fixed Frame>
       Value: true
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
-      Name: MarkerArray
+      Enabled: true
+      Name: MCP Scene Markers
       Namespaces:
         {}
       Topic:
@@ -50,8 +50,8 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /rviz_visual_tools
-      Value: false
+        Value: /mcp_server/scene_markers
+      Value: true
     - Class: moveit_rviz_plugin/Trajectory
       Color Enabled: false
       Enabled: true

@@ -1,0 +1,8 @@
+string held_object_name
+string reference_object_name
+string direction
+float64 distance_cm
+---
+bool success
+string message
+string result_json

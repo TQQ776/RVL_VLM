@@ -37,23 +37,28 @@
     omni_speech_style: 清晰、自然、友好，适合机器人语音助手
     omni_timeout: 90.0
     omni_max_tokens: 1000
+    conversation_memory_enabled: true
+    conversation_memory_max_turns: 8
+    conversation_memory_max_chars: 4000
 
     play_tts: true
 
     list_tools_service: /mcp_server/list_tools
     call_tool_service: /mcp_server/call_tool
+    mcp_emergency_stop_service: /mcp_server/emergency_stop
     push_to_talk_enabled: false
     push_to_talk_key: r
     stop_record_key: q
     min_record_seconds: 0.3
     text_popup_enabled: true
     text_popup_key: t
-    text_popup_title: MCP 文本输入
+    text_popup_title: fr3对话框
     text_popup_prompt: 输入文本后按 Enter 发送，Shift+Enter 换行；也可以点击录音按钮语音输入。
     text_popup_auto_open: true
 
     mcp_service_wait_timeout_sec: 10.0
     mcp_tool_timeout_sec: 220.0
+    mcp_long_tool_timeout_sec: 900.0
     mcp_max_tool_rounds: 10
 
     auto_run: false

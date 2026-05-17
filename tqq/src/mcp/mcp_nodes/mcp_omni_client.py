@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -13,6 +14,7 @@ from audio_dialog.audio_dialog_node import AudioDialogNode
 from mcp.srv import CallTool, ListTools
 from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 
 class McpOmniClient(AudioDialogNode):
@@ -23,9 +25,17 @@ class McpOmniClient(AudioDialogNode):
 
         self._tool_schema_cache = None
         self._tool_schema_cache_time = 0.0
+        self._conversation_memory_lock = threading.Lock()
+        self._conversation_memory: List[Dict] = []
+        self._conversation_tool_result_lock = threading.Lock()
+        self._current_conversation_tool_results: Optional[List[str]] = None
 
         self.list_tools_client = self.create_client(ListTools, self.list_tools_service)
         self.call_tool_client = self.create_client(CallTool, self.call_tool_service)
+        self.emergency_stop_client = self.create_client(
+            Trigger,
+            self.mcp_emergency_stop_service,
+        )
 
         self.get_logger().info(
             'Qwen-Omni Realtime MCP client ready. '
@@ -50,6 +60,9 @@ class McpOmniClient(AudioDialogNode):
         self.declare_parameter('omni_realtime_connect_retry_delay_sec', 1.0)
         self.declare_parameter('omni_timeout', 90.0)
         self.declare_parameter('omni_max_tokens', 1000)
+        self.declare_parameter('conversation_memory_enabled', True)
+        self.declare_parameter('conversation_memory_max_turns', 8)
+        self.declare_parameter('conversation_memory_max_chars', 4000)
         self.declare_parameter('omni_native_audio_output_enabled', True)
         self.declare_parameter('omni_native_audio_fallback_to_local_tts', False)
         self.declare_parameter('omni_native_audio_sample_rate', 24000)
@@ -62,8 +75,10 @@ class McpOmniClient(AudioDialogNode):
 
         self.declare_parameter('list_tools_service', '/mcp_server/list_tools')
         self.declare_parameter('call_tool_service', '/mcp_server/call_tool')
+        self.declare_parameter('mcp_emergency_stop_service', '/mcp_server/emergency_stop')
         self.declare_parameter('mcp_service_wait_timeout_sec', 10.0)
         self.declare_parameter('mcp_tool_timeout_sec', 80.0)
+        self.declare_parameter('mcp_long_tool_timeout_sec', 900.0)
         self.declare_parameter('mcp_max_tool_rounds', 10)
 
     def _read_parameters(self) -> None:
@@ -89,6 +104,17 @@ class McpOmniClient(AudioDialogNode):
         )
         self.omni_timeout = float(self.get_parameter('omni_timeout').value)
         self.omni_max_tokens = int(self.get_parameter('omni_max_tokens').value)
+        self.conversation_memory_enabled = self._as_bool(
+            self.get_parameter('conversation_memory_enabled').value
+        )
+        self.conversation_memory_max_turns = max(
+            1,
+            int(self.get_parameter('conversation_memory_max_turns').value),
+        )
+        self.conversation_memory_max_chars = max(
+            500,
+            int(self.get_parameter('conversation_memory_max_chars').value),
+        )
         self.omni_native_audio_output_enabled = self._as_bool(
             self.get_parameter('omni_native_audio_output_enabled').value
         )
@@ -111,17 +137,29 @@ class McpOmniClient(AudioDialogNode):
 
         self.list_tools_service = str(self.get_parameter('list_tools_service').value)
         self.call_tool_service = str(self.get_parameter('call_tool_service').value)
+        self.mcp_emergency_stop_service = str(
+            self.get_parameter('mcp_emergency_stop_service').value
+        )
         self.mcp_service_wait_timeout_sec = float(
             self.get_parameter('mcp_service_wait_timeout_sec').value
         )
         self.mcp_tool_timeout_sec = float(self.get_parameter('mcp_tool_timeout_sec').value)
+        self.mcp_long_tool_timeout_sec = float(
+            self.get_parameter('mcp_long_tool_timeout_sec').value
+        )
         self.mcp_max_tool_rounds = max(1, int(self.get_parameter('mcp_max_tool_rounds').value))
 
     def _process_audio_file(self, wav_path: Path):
         self._publish_status(f'omni_audio_input={wav_path}')
         self._set_last_transcript_text('')
         self.transcript_pub.publish(String(data=''))
-        response_text = self._run_omni_realtime_tool_turn(wav_path)
+        self._begin_conversation_tool_capture()
+        try:
+            response_text = self._run_omni_realtime_tool_turn(wav_path)
+        finally:
+            tool_results = self._finish_conversation_tool_capture()
+        transcript = self._get_last_transcript_text() or f'语音输入:{wav_path.name}'
+        self._remember_conversation_turn(transcript, response_text, tool_results)
         self._publish_response(response_text)
         self._speak_omni_response(response_text)
         return True, response_text
@@ -139,24 +177,64 @@ class McpOmniClient(AudioDialogNode):
         self._set_last_transcript_text(text)
         self._publish_status(f'transcript={text}')
         self.transcript_pub.publish(String(data=text))
-        response_text = self._run_omni_text_tool_turn(text)
+        self._begin_conversation_tool_capture()
+        try:
+            response_text = self._run_omni_text_tool_turn(text)
+        finally:
+            tool_results = self._finish_conversation_tool_capture()
+        self._remember_conversation_turn(text, response_text, tool_results)
         self._publish_response(response_text)
         self._speak_omni_response(response_text)
         return True, response_text
 
     def _text_popup_actions(self):
         return [
+            ('急停', self._run_emergency_stop_popup_action, {
+                'danger': True,
+                'always_enabled': True,
+            }),
             ('关闭夹爪', lambda: self._run_popup_action('close_gripper', '关闭夹爪')),
             ('打开夹爪', lambda: self._run_popup_action('open_gripper', '打开夹爪')),
             ('回到初始位置', lambda: self._run_popup_action('go_home', '回到初始位置')),
         ]
+
+    def _run_emergency_stop_popup_action(self) -> str:
+        self._interrupt_tts_playback()
+        self._publish_status('text_popup_action=emergency_stop')
+        if not self.emergency_stop_client.wait_for_service(timeout_sec=1.0):
+            message = f'{self.mcp_emergency_stop_service} unavailable'
+            self._publish_response(f'急停失败：{message}')
+            return f'急停失败：{message}'
+
+        future = self.emergency_stop_client.call_async(Trigger.Request())
+        response = self._wait_for_service_future(
+            future,
+            self.mcp_emergency_stop_service,
+            timeout_sec=2.0,
+        )
+        if response is None:
+            message = '急停请求已发出，但等待服务反馈超时。请观察机械臂状态。'
+            self._publish_response(message)
+            return message
+
+        status = '已触发' if response.success else '失败'
+        message = str(response.message or '').strip()
+        response_text = f'急停{status}：{message or "无返回信息"}'
+        self._capture_conversation_tool_result(response_text)
+        self._publish_response(response_text)
+        return response_text
 
     def _run_popup_action(self, tool_name: str, label: str) -> str:
         if not self._busy_lock.acquire(blocking=False):
             return '现在还在处理上一条消息，请稍等一下。'
         try:
             self._publish_status(f'text_popup_action={tool_name}')
-            response_text = self._run_omni_named_tool(tool_name, {})
+            self._begin_conversation_tool_capture()
+            try:
+                response_text = self._run_omni_named_tool(tool_name, {})
+            finally:
+                tool_results = self._finish_conversation_tool_capture()
+            self._remember_conversation_turn(label, response_text, tool_results)
             self._publish_response(response_text)
             self._speak_omni_response(response_text)
             if self._tool_result_failed(response_text):
@@ -267,7 +345,7 @@ class McpOmniClient(AudioDialogNode):
                 'output_modalities': [MultiModality.TEXT],
                 'voice': self.omni_realtime_voice or 'Ethan',
                 'enable_turn_detection': False,
-                'instructions': self._omni_tool_instructions(),
+                'instructions': self._realtime_tool_instructions_with_memory(),
             }
             if self.omni_realtime_enable_search:
                 update_kwargs['enable_search'] = True
@@ -288,6 +366,43 @@ class McpOmniClient(AudioDialogNode):
             for _ in range(self.mcp_max_tool_rounds):
                 if not function_calls:
                     answer = self._collected_realtime_text(final_text, text_parts, lock)
+                    direct_calls = self._direct_tool_calls_from_user_text(user_transcript['value'])
+                    if direct_calls:
+                        self._publish_status(
+                            'omni_realtime_direct_tool_route='
+                            + ';'.join(
+                                f'{call["name"]} args={call["arguments"]}'
+                                for call in direct_calls
+                            )
+                        )
+                        tool_results = []
+                        for direct_call in direct_calls:
+                            result_text = self._run_compatible_tool_call(direct_call)
+                            tool_results.append(result_text)
+                            all_tool_results.append(result_text)
+                            if self._tool_result_failed(result_text):
+                                break
+                        failed_results = [
+                            text for text in tool_results if self._tool_result_failed(text)
+                        ]
+                        if failed_results:
+                            return self._format_failed_tool_answer(
+                                user_transcript['value'],
+                                failed_results,
+                            )
+                        if self._tool_results_complete_user_request(
+                            user_transcript['value'],
+                            tool_results,
+                        ):
+                            return self._format_success_tool_answer(
+                                user_transcript['value'],
+                                tool_results,
+                            )
+                        return self._guard_final_answer(
+                            '；'.join(tool_results) or answer,
+                            all_tool_results,
+                            user_transcript['value'],
+                        )
                     routed_call = self._route_next_text_step_with_llm(
                         route_client,
                         user_transcript['value'],
@@ -297,7 +412,11 @@ class McpOmniClient(AudioDialogNode):
                     if routed_call:
                         if routed_call['name'] == 'final_answer':
                             final_answer = self._final_answer_from_routed_call(routed_call) or answer
-                            return self._guard_final_answer(final_answer, all_tool_results)
+                            return self._guard_final_answer(
+                                final_answer,
+                                all_tool_results,
+                                user_transcript['value'],
+                            )
                         self._publish_status(
                             'omni_realtime_tool_router='
                             f'{routed_call["name"]} args={routed_call["arguments"]}'
@@ -305,9 +424,20 @@ class McpOmniClient(AudioDialogNode):
                         result_text = self._run_compatible_tool_call(routed_call)
                         all_tool_results.append(result_text)
                         if self._tool_result_failed(result_text):
-                            return self._format_failed_tool_answer([result_text])
-                        return self._guard_final_answer(result_text, all_tool_results)
-                    return self._guard_final_answer(answer, all_tool_results)
+                            return self._format_failed_tool_answer(
+                                user_transcript['value'],
+                                [result_text],
+                            )
+                        return self._guard_final_answer(
+                            result_text,
+                            all_tool_results,
+                            user_transcript['value'],
+                        )
+                    return self._guard_final_answer(
+                        answer,
+                        all_tool_results,
+                        user_transcript['value'],
+                    )
 
                 current_calls = list(function_calls)
                 tool_results = []
@@ -331,7 +461,18 @@ class McpOmniClient(AudioDialogNode):
 
                 failed_results = [text for text in tool_results if self._tool_result_failed(text)]
                 if failed_results:
-                    return self._format_failed_tool_answer(failed_results)
+                    return self._format_failed_tool_answer(
+                        user_transcript['value'],
+                        failed_results,
+                    )
+                if self._tool_results_complete_user_request(
+                    user_transcript['value'],
+                    tool_results,
+                ):
+                    return self._format_success_tool_answer(
+                        user_transcript['value'],
+                        tool_results,
+                    )
 
                 self._clear_realtime_buffers(
                     done_event,
@@ -355,6 +496,7 @@ class McpOmniClient(AudioDialogNode):
             return self._guard_final_answer(
                 final_answer or '；'.join(all_tool_results) or '好的。',
                 all_tool_results,
+                user_transcript['value'],
             )
         finally:
             try:
@@ -376,10 +518,19 @@ class McpOmniClient(AudioDialogNode):
             base_url=self.omni_base_url,
             timeout=self.omni_timeout,
         )
-        messages = [
-            {'role': 'system', 'content': self._omni_tool_instructions()},
-            {'role': 'user', 'content': self._omni_user_content(user_text)},
-        ]
+        direct_calls = self._direct_tool_calls_from_user_text(user_text)
+        if direct_calls:
+            self._publish_status(
+                'omni_pre_direct_tool_route='
+                + ';'.join(
+                    f'{call["name"]} args={call["arguments"]}' for call in direct_calls
+                )
+            )
+            return self._run_direct_tool_calls_for_request(user_text, direct_calls)
+
+        messages = [{'role': 'system', 'content': self._omni_tool_instructions()}]
+        messages.extend(self._conversation_context_messages())
+        messages.append({'role': 'user', 'content': self._omni_user_content(user_text)})
         self._publish_status(f'llm=omni_text_tools model={self.omni_text_model}')
         all_tool_results = []
         for _ in range(self.mcp_max_tool_rounds):
@@ -398,6 +549,24 @@ class McpOmniClient(AudioDialogNode):
             response = client.chat.completions.create(**request_kwargs)
             answer, tool_calls = self._collect_compatible_stream_response(response)
             if not tool_calls:
+                direct_calls = self._direct_tool_calls_from_user_text(user_text)
+                if direct_calls:
+                    tool_calls = direct_calls
+                    self._publish_status(
+                        'omni_direct_tool_route='
+                        + ';'.join(
+                            f'{call["name"]} args={call["arguments"]}' for call in direct_calls
+                        )
+                    )
+                else:
+                    pseudo_call = self._pseudo_tool_call_from_answer(answer, user_text)
+                    if pseudo_call:
+                        tool_calls = [pseudo_call]
+                        self._publish_status(
+                            'omni_pseudo_tool_route='
+                            f'{pseudo_call["name"]} args={pseudo_call["arguments"]}'
+                        )
+            if not tool_calls:
                 routed_call = self._route_next_text_step_with_llm(
                     client,
                     user_text,
@@ -407,14 +576,14 @@ class McpOmniClient(AudioDialogNode):
                 if routed_call:
                     if routed_call['name'] == 'final_answer':
                         final_answer = self._final_answer_from_routed_call(routed_call) or answer
-                        return self._guard_final_answer(final_answer, all_tool_results)
+                        return self._guard_final_answer(final_answer, all_tool_results, user_text)
                     tool_calls = [routed_call]
                     self._publish_status(
                         'omni_tool_router='
                         f'{routed_call["name"]} args={routed_call["arguments"]}'
                     )
                 elif answer:
-                    return self._guard_final_answer(answer, all_tool_results)
+                    return self._guard_final_answer(answer, all_tool_results, user_text)
                 elif all_tool_results:
                     return '；'.join(all_tool_results)
                 else:
@@ -450,7 +619,9 @@ class McpOmniClient(AudioDialogNode):
 
             failed_results = [text for text in tool_results if self._tool_result_failed(text)]
             if failed_results:
-                return self._format_failed_tool_answer(failed_results)
+                return self._format_failed_tool_answer(user_text, failed_results)
+            if self._tool_results_complete_user_request(user_text, tool_results):
+                return self._format_success_tool_answer(user_text, tool_results)
 
             messages.append({
                 'role': 'system',
@@ -458,7 +629,36 @@ class McpOmniClient(AudioDialogNode):
             })
 
         self.get_logger().warn('Qwen-Omni requested too many text tool rounds; stopping tool loop.')
-        return self._guard_final_answer('；'.join(all_tool_results) or '好的。', all_tool_results)
+        return self._guard_final_answer(
+            '；'.join(all_tool_results) or '好的。',
+            all_tool_results,
+            user_text,
+        )
+
+    def _run_direct_tool_calls_for_request(self, user_text: str, direct_calls: List[Dict]) -> str:
+        tool_results = []
+        all_tool_results = []
+        for direct_call in direct_calls:
+            result_text = self._run_compatible_tool_call(direct_call)
+            tool_results.append(result_text)
+            all_tool_results.append(result_text)
+            if self._tool_result_failed(result_text):
+                break
+
+        failed_results = [text for text in tool_results if self._tool_result_failed(text)]
+        if failed_results:
+            return self._format_failed_tool_answer(user_text, failed_results)
+        if self._tool_results_complete_user_request(user_text, tool_results):
+            return self._format_success_tool_answer(user_text, tool_results)
+        if tool_results and all(
+            self._is_terminal_action_success_result(text) for text in tool_results
+        ):
+            return self._format_success_tool_answer(user_text, tool_results)
+        return self._guard_final_answer(
+            '；'.join(tool_results) or '工具调用没有返回结果。',
+            all_tool_results,
+            user_text,
+        )
 
     def _connect_realtime_with_retry(self, conversation, label: str) -> None:
         attempts = max(1, self.omni_realtime_connect_retries)
@@ -488,10 +688,21 @@ class McpOmniClient(AudioDialogNode):
             f'{label} websocket connection failed after {attempts} attempts: {last_error}'
         )
 
-    def _guard_final_answer(self, answer: str, tool_results: List[str]) -> str:
+    def _guard_final_answer(
+        self,
+        answer: str,
+        tool_results: List[str],
+        user_text: str = '',
+    ) -> str:
         answer = str(answer or '').strip()
         if not answer:
             return ''
+        if (
+            self._looks_like_execution_request(user_text)
+            and not tool_results
+            and self._claims_action_success(answer)
+        ):
+            return '这是一条新的执行命令，我还没有调用工具，不能确认已经完成。'
         if self._claims_grasp_success(answer) and not any(
             self._is_grab_success_result(result) for result in tool_results
         ):
@@ -501,12 +712,61 @@ class McpOmniClient(AudioDialogNode):
                     if self._is_grab_attempt_result(result) and self._tool_result_failed(result)
                 ]
                 if failed_results:
-                    return self._format_failed_tool_answer(failed_results)
+                    return self._format_failed_tool_answer('当前抓取请求', failed_results)
                 return '抓取命令已经发送，但还没有确认真正抓取完成。'
             return '我还没有执行抓取工具，不能确认抓取成功。'
         if any(self._is_grab_success_result(result) for result in tool_results):
             return '已发送抓取命令，正在执行抓取。'
         return answer
+
+    def _looks_like_execution_request(self, user_text: str) -> bool:
+        text = ''.join(str(user_text or '').strip().split()).lower()
+        if not text or self._looks_like_question(text):
+            return False
+        action_tokens = (
+            '把',
+            '将',
+            '放',
+            '放在',
+            '放到',
+            '放进',
+            '放入',
+            '抓',
+            '抓取',
+            '拿',
+            '拿起',
+            '夹',
+            '夹取',
+            '打开夹爪',
+            '关闭夹爪',
+            '回到',
+            'home',
+            '移动',
+            '下降',
+            '上升',
+        )
+        return any(token in text for token in action_tokens)
+
+    @staticmethod
+    def _claims_action_success(answer: str) -> bool:
+        text = ''.join(str(answer or '').strip().split()).lower()
+        if not text:
+            return False
+        success_markers = (
+            '已成功',
+            '已经成功',
+            '成功将',
+            '成功把',
+            '已完成',
+            '已经完成',
+            '任务完成',
+            '放好了',
+            '抓好了',
+            '完成了',
+            'successfully',
+            'completed',
+        )
+        return any(marker in text for marker in success_markers)
 
     def _route_next_text_step_with_llm(
         self,
@@ -542,6 +802,7 @@ class McpOmniClient(AudioDialogNode):
                 'role': 'user',
                 'content': json.dumps({
                     'original_user_request': user_text,
+                    'conversation_context': self._conversation_context_data(),
                     'assistant_draft_answer': draft_answer,
                     'tool_results_so_far': tool_results,
                     'available_actions': tool_names,
@@ -597,6 +858,384 @@ class McpOmniClient(AudioDialogNode):
             return ''
         return str(arguments.get('final_answer') or '').strip()
 
+    def _direct_tool_call_from_user_text(self, user_text: str) -> Optional[Dict]:
+        calls = self._direct_tool_calls_from_user_text(user_text)
+        return calls[0] if calls else None
+
+    def _direct_tool_calls_from_user_text(self, user_text: str) -> List[Dict]:
+        text = ''.join(str(user_text or '').strip().split())
+        if not text:
+            return []
+        if self._looks_like_question(text):
+            return []
+
+        place_match = re.search(
+            r'^(?:请|帮我|麻烦你)?(?:把|将)(.+?)(?:放到|放进|放入|放在|放)(.+)$',
+            text,
+        )
+        if place_match:
+            object_phrase = place_match.group(1)
+            object_name = self._clean_object_phrase(object_phrase)
+            place_target = place_match.group(2)
+            relative = self._parse_relative_place_target(place_target)
+            if object_name and relative:
+                return [self._make_tool_call(
+                    'pick_and_place_relative',
+                    {
+                        'object_name': object_name,
+                        'reference_object_name': relative['reference_object_name'],
+                        'direction': relative['direction'],
+                        'distance_cm': relative['distance_cm'],
+                    },
+                    'direct_place_relative',
+                )]
+            container_name = self._clean_container_phrase(place_target)
+            if object_name and container_name and self._looks_like_container_target(place_target):
+                if self._looks_like_multi_object_task(object_phrase):
+                    task_request = str(user_text or '').strip()
+                    if self._is_daily_fruit_task_text(object_phrase):
+                        task_request = self._daily_fruit_task_request(task_request)
+                    return [self._make_tool_call(
+                        'pick_all_fruits_into_container',
+                        {
+                            'container_name': container_name,
+                            'task_request': task_request,
+                        },
+                        'direct_all_fruits_container',
+                    )]
+                object_names = self._split_object_list_phrase(object_phrase)
+                if not object_names:
+                    object_names = [object_name]
+                return [
+                    self._make_tool_call(
+                        'pick_and_place_into_container',
+                        {
+                            'object_name': name,
+                            'container_name': container_name,
+                        },
+                        'direct_place_container',
+                    )
+                    for name in object_names
+                ]
+
+        grab_match = re.search(r'^(?:请|帮我|麻烦你)?(?:抓取|抓|拿起|拿|夹取|夹)(.+)$', text)
+        if grab_match and not any(token in text for token in ('放', '放到', '放进', '放入')):
+            object_name = self._clean_object_phrase(grab_match.group(1))
+            if object_name:
+                return [self._make_tool_call(
+                    'grab_api_object',
+                    {'object_name': object_name},
+                    'direct_grab',
+                )]
+        return []
+
+    @staticmethod
+    def _looks_like_question(text: str) -> bool:
+        question_markers = (
+            '为什么',
+            '怎么',
+            '如何',
+            '能不能',
+            '可不可以',
+            '可以吗',
+            '行不行',
+            '吗',
+            '?',
+            '？',
+        )
+        return any(marker in str(text or '') for marker in question_markers)
+
+    def _pseudo_tool_call_from_answer(self, answer: str, user_text: str) -> Optional[Dict]:
+        text = str(answer or '')
+        if not text:
+            return None
+        tool_name = ''
+        xml_match = re.search(r'<function=([A-Za-z_][A-Za-z0-9_]*)\s*>', text)
+        if xml_match:
+            tool_name = xml_match.group(1)
+        if not tool_name:
+            code_match = re.search(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\(', text)
+            if code_match and 'tool' in text.lower():
+                tool_name = code_match.group(1)
+        if not tool_name:
+            return None
+
+        mapped = self._map_legacy_tool_name(tool_name, user_text)
+        if mapped == 'pick_and_place_into_container':
+            direct = self._direct_tool_call_from_user_text(user_text)
+            if direct and direct.get('name') == 'pick_and_place_into_container':
+                return direct
+        if mapped in ('observe_scene', 'list_api_objects'):
+            return self._make_tool_call(
+                mapped,
+                {'question': user_text},
+                'pseudo_vision',
+            )
+        return None
+
+    def _map_legacy_tool_name(self, tool_name: str, user_text: str) -> str:
+        name = str(tool_name or '').strip()
+        text = ''.join(str(user_text or '').split())
+        if name in (
+            'fr3_vision_detect_objects',
+            'get_camera_image_and_detect_objects',
+            'get_camera_image',
+            'detect_objects',
+        ):
+            if any(token in text for token in ('放到', '放进', '放入', '放')) and any(
+                token in text for token in ('箱', '盒', '筐', 'box', 'container')
+            ):
+                return 'pick_and_place_into_container'
+            return 'observe_scene'
+        return name
+
+    def _make_tool_call(self, name: str, arguments: Dict, prefix: str) -> Dict:
+        return {
+            'id': f'call_{prefix}_{uuid.uuid4().hex}',
+            'name': name,
+            'arguments': json.dumps(arguments or {}, ensure_ascii=False),
+        }
+
+    def _parse_relative_place_target(self, text: str) -> Optional[Dict]:
+        value = str(text or '').strip()
+        if not value:
+            return None
+        value = re.sub(r'(?:的位置|的位置处|位置|处)$', '', value)
+        direction_pattern = r'(左边|右边|前面|后面|後面|上面|下面|左方|右方|前方|后方|後方|上方|下方|左|右|前|后|後|上|下|left|right|front|forward|back|behind|up|down|above|below)'
+        distance_pattern = (
+            r'([0-9]+(?:\.[0-9]+)?|'
+            r'[零〇一二两兩三四五六七八九十百半]+(?:点[零〇一二两兩三四五六七八九]+)?)'
+        )
+        match = re.search(
+            rf'(.+?){direction_pattern}(?:(?:约|大约|大概)?{distance_pattern}(?:厘米|公分|cm|CM)?)?$',
+            value,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            match = re.search(
+                rf'(.+?)(?:约|大约|大概)?{distance_pattern}(?:厘米|公分|cm|CM){direction_pattern}$',
+                value,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                return None
+            reference = self._clean_reference_phrase(match.group(1))
+            distance_cm = self._parse_distance_cm(match.group(2))
+            direction = self._normalize_relative_direction(match.group(3))
+        else:
+            reference = self._clean_reference_phrase(match.group(1))
+            direction = self._normalize_relative_direction(match.group(2))
+            distance_cm = (
+                self._parse_distance_cm(match.group(3))
+                if match.group(3)
+                else self._default_relative_distance_cm(direction)
+            )
+        if not reference or not direction or distance_cm is None:
+            return None
+        return {
+            'reference_object_name': reference,
+            'direction': direction,
+            'distance_cm': distance_cm,
+        }
+
+    @staticmethod
+    def _default_relative_distance_cm(direction: str) -> float:
+        if direction == '上':
+            return 1.0
+        return 5.0
+
+    @staticmethod
+    def _parse_distance_cm(text: str) -> Optional[float]:
+        value = ''.join(str(text or '').strip().split()).lower()
+        if not value:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        value = value.replace('兩', '两')
+        if value == '半':
+            return 0.5
+        if '点' in value:
+            integer_text, decimal_text = value.split('点', 1)
+            integer_value = McpOmniClient._parse_chinese_integer(integer_text)
+            if integer_value is None:
+                return None
+            digit_map = {
+                '零': '0',
+                '〇': '0',
+                '一': '1',
+                '二': '2',
+                '两': '2',
+                '三': '3',
+                '四': '4',
+                '五': '5',
+                '六': '6',
+                '七': '7',
+                '八': '8',
+                '九': '9',
+            }
+            decimal_digits = ''.join(digit_map.get(char, '') for char in decimal_text)
+            if len(decimal_digits) != len(decimal_text):
+                return None
+            return float(f'{integer_value}.{decimal_digits}')
+        integer_value = McpOmniClient._parse_chinese_integer(value)
+        return float(integer_value) if integer_value is not None else None
+
+    @staticmethod
+    def _parse_chinese_integer(text: str) -> Optional[int]:
+        value = ''.join(str(text or '').strip().split()).replace('兩', '两')
+        if not value:
+            return 0
+        digit_map = {
+            '零': 0,
+            '〇': 0,
+            '一': 1,
+            '二': 2,
+            '两': 2,
+            '三': 3,
+            '四': 4,
+            '五': 5,
+            '六': 6,
+            '七': 7,
+            '八': 8,
+            '九': 9,
+        }
+        if value in digit_map:
+            return digit_map[value]
+        if '百' in value:
+            left, _, right = value.partition('百')
+            hundreds = McpOmniClient._parse_chinese_integer(left) if left else 1
+            remainder = McpOmniClient._parse_chinese_integer(right) if right else 0
+            if hundreds is None or remainder is None:
+                return None
+            return hundreds * 100 + remainder
+        if '十' in value:
+            left, _, right = value.partition('十')
+            tens = McpOmniClient._parse_chinese_integer(left) if left else 1
+            ones = McpOmniClient._parse_chinese_integer(right) if right else 0
+            if tens is None or ones is None:
+                return None
+            return tens * 10 + ones
+        if all(char in digit_map for char in value):
+            return int(''.join(str(digit_map[char]) for char in value))
+        return None
+
+    @staticmethod
+    def _normalize_relative_direction(text: str) -> str:
+        value = ''.join(str(text or '').strip().lower().split())
+        mapping = {
+            '左': '左',
+            '左边': '左',
+            '左方': '左',
+            'left': '左',
+            '右': '右',
+            '右边': '右',
+            '右方': '右',
+            'right': '右',
+            '前': '前',
+            '前面': '前',
+            '前方': '前',
+            'front': '前',
+            'forward': '前',
+            '后': '后',
+            '後': '后',
+            '后面': '后',
+            '後面': '后',
+            '后方': '后',
+            '後方': '后',
+            'back': '后',
+            'behind': '后',
+            '上': '上',
+            '上面': '上',
+            '上方': '上',
+            'up': '上',
+            'above': '上',
+            '下': '下',
+            '下面': '下',
+            '下方': '下',
+            'down': '下',
+            'below': '下',
+        }
+        return mapping.get(value, value)
+
+    @staticmethod
+    def _clean_reference_phrase(text: str) -> str:
+        value = str(text or '').strip()
+        for prefix in ('在', '到', '至'):
+            if value.startswith(prefix):
+                value = value[len(prefix):]
+                break
+        for token in ('这个', '那个', '这颗', '那颗', '一个', '一颗', '当前', '识别到的'):
+            value = value.replace(token, '')
+        return value.strip(' ，,。.;；:：的')
+
+    @staticmethod
+    def _looks_like_container_target(text: str) -> bool:
+        value = ''.join(str(text or '').strip().split()).lower()
+        return any(token in value for token in ('箱', '盒', '筐', '篮', 'container', 'box', 'bin', 'basket')) or value.endswith(('里', '里面', '内', '中'))
+
+    @staticmethod
+    def _clean_object_phrase(text: str) -> str:
+        value = str(text or '').strip()
+        for token in ('这个', '那个', '这颗', '那颗', '一个', '一颗', '当前', '识别到的'):
+            value = value.replace(token, '')
+        return value.strip(' ，,。.;；:：的')
+
+    def _split_object_list_phrase(self, text: str) -> List[str]:
+        value = str(text or '').strip()
+        if not value:
+            return []
+        if self._looks_like_multi_object_task(''.join(value.split())):
+            return []
+        parts = [
+            part
+            for part in re.split(r'(?:、|和|跟|与|以及|,|，|;|；|再(?:把)?|然后(?:把)?|接着(?:把)?)', value)
+            if part
+        ]
+        names = []
+        for part in parts:
+            name = self._clean_object_phrase(part)
+            if name and name not in names:
+                names.append(name)
+        return names if len(names) > 1 else []
+
+    @staticmethod
+    def _clean_container_phrase(text: str) -> str:
+        value = str(text or '').strip()
+        for token in ('这个', '那个', '一个', '当前', '识别到的'):
+            value = value.replace(token, '')
+        value = value.strip(' ，,。.;；:：的')
+        for suffix in ('里面', '里边', '里', '内', '中'):
+            if value.endswith(suffix):
+                value = value[:-len(suffix)]
+                break
+        value = value.strip(' ，,。.;；:：的')
+        aliases = {
+            '箱': '箱子',
+            '盒': '盒子',
+            '框': '箱子',
+            '筐': '筐',
+            '篮': '篮子',
+            '篮筐': '篮子',
+        }
+        return aliases.get(value, value)
+
+    @staticmethod
+    def _is_daily_fruit_task_text(text: str) -> bool:
+        compact = ''.join(str(text or '').split()).lower()
+        return '水果' in compact or 'fruit' in compact
+
+    def _daily_fruit_task_request(self, user_text: str) -> str:
+        text = str(user_text or '').strip()
+        hint = (
+            '（任务口径：所有水果按日常食用水果理解，不按植物学果实理解；'
+            '辣椒、青椒、甜椒、番茄、黄瓜、茄子等日常作为蔬菜或调味食材的物体不属于本任务目标。）'
+        )
+        if hint in text:
+            return text
+        return f'{text}{hint}'
+
     def _claims_grasp_success(self, answer: str) -> bool:
         compact = ''.join(str(answer or '').split())
         if not compact:
@@ -634,19 +1273,11 @@ class McpOmniClient(AudioDialogNode):
 
     def _is_grab_attempt_result(self, result_text: str) -> bool:
         lowered = str(result_text or '').lower()
-        return (
-            '/grab_object' in lowered
-            or 'grab_object' in lowered
-            or 'grab_api_object' in lowered
-        )
+        return 'grab_api_object' in lowered
 
     def _is_grab_success_result(self, result_text: str) -> bool:
         lowered = str(result_text or '').lower()
-        success_marker = (
-            '/grab_object success:' in lowered
-            or 'grab_object success:' in lowered
-            or 'grab_api_object success:' in lowered
-        )
+        success_marker = 'grab_api_object success:' in lowered
         return (
             success_marker
             and ' failed:' not in lowered
@@ -657,6 +1288,96 @@ class McpOmniClient(AudioDialogNode):
 
     def _omni_user_content(self, user_text: str):
         return user_text
+
+    def _conversation_context_data(self) -> List[Dict]:
+        if not getattr(self, 'conversation_memory_enabled', False):
+            return []
+        with self._conversation_memory_lock:
+            turns = list(self._conversation_memory[-self.conversation_memory_max_turns:])
+        if not turns:
+            return []
+
+        max_chars = max(500, int(self.conversation_memory_max_chars))
+        selected = []
+        total_chars = 0
+        for turn in reversed(turns):
+            slim = {
+                'user': str(turn.get('user') or ''),
+                'assistant': str(turn.get('assistant') or ''),
+            }
+            tool_results = turn.get('tool_results') or []
+            if tool_results:
+                slim['tool_results'] = [str(result) for result in tool_results[:6]]
+            encoded_len = len(json.dumps(slim, ensure_ascii=False))
+            if selected and total_chars + encoded_len > max_chars:
+                break
+            selected.append(slim)
+            total_chars += encoded_len
+        selected.reverse()
+        return selected
+
+    def _conversation_context_messages(self) -> List[Dict]:
+        context = self._conversation_context_data()
+        if not context:
+            return []
+        content = (
+            '以下是同一位用户在本节点里的近期对话和工具结果记忆。'
+            '回答“刚刚/之前/你都/已经”等追问时要优先参考这些记忆；'
+            '如果用户的新请求要求读取当前画面或执行动作，仍然按工具说明调用工具。'
+            f'\n{json.dumps(context, ensure_ascii=False)}'
+        )
+        return [{'role': 'system', 'content': content}]
+
+    def _remember_conversation_turn(
+        self,
+        user_text: str,
+        assistant_text: str,
+        tool_results: Optional[List[str]] = None,
+    ) -> None:
+        if not getattr(self, 'conversation_memory_enabled', False):
+            return
+        user_text = str(user_text or '').strip()
+        assistant_text = str(assistant_text or '').strip()
+        results = [
+            self._trim_memory_text(str(result or '').strip(), 900)
+            for result in (tool_results or [])
+            if str(result or '').strip()
+        ]
+        if not user_text and not assistant_text and not results:
+            return
+        turn = {
+            'time_sec': time.time(),
+            'user': self._trim_memory_text(user_text, 500),
+            'assistant': self._trim_memory_text(assistant_text, 700),
+            'tool_results': results[-8:],
+        }
+        with self._conversation_memory_lock:
+            self._conversation_memory.append(turn)
+            max_turns = max(1, int(self.conversation_memory_max_turns))
+            if len(self._conversation_memory) > max_turns:
+                self._conversation_memory = self._conversation_memory[-max_turns:]
+
+    @staticmethod
+    def _trim_memory_text(text: str, max_chars: int) -> str:
+        value = str(text or '').strip()
+        if len(value) <= max_chars:
+            return value
+        return value[:max(0, max_chars - 3)].rstrip() + '...'
+
+    def _begin_conversation_tool_capture(self) -> None:
+        with self._conversation_tool_result_lock:
+            self._current_conversation_tool_results = []
+
+    def _capture_conversation_tool_result(self, result_text: str) -> None:
+        with self._conversation_tool_result_lock:
+            if self._current_conversation_tool_results is not None:
+                self._current_conversation_tool_results.append(str(result_text or '').strip())
+
+    def _finish_conversation_tool_capture(self) -> List[str]:
+        with self._conversation_tool_result_lock:
+            results = list(self._current_conversation_tool_results or [])
+            self._current_conversation_tool_results = None
+        return results
 
     def _speak_omni_response(self, text: str) -> None:
         if self.omni_native_audio_output_enabled and self.play_tts:
@@ -811,6 +1532,11 @@ class McpOmniClient(AudioDialogNode):
             '优先直接回答，除非回答必须读取当前相机或工具状态。'
             '如果用户明确要求立即执行一个工具能力，按 tools 描述填写参数；'
             '如果用户一次给出多个顺序任务，必须按用户顺序逐个调用工具。'
+            '如果用户说“所有/全部/每个水果”等集合任务，要循环处理每一个可见且尚未完成的目标，'
+            '其中“水果/all fruits”按日常食用水果理解，不按植物学果实概念理解；'
+            '辣椒、青椒、甜椒、番茄、黄瓜、茄子等日常作为蔬菜或调味食材的物体，'
+            '除非用户明确点名，否则不属于“所有水果”任务目标。'
+            '每完成一次抓放后继续观察/判断下一步，直到没有符合条件的目标。'
             '前一个工具成功返回后，继续判断并执行下一个尚未完成的步骤；'
             '只有所有步骤完成、遇到失败，或缺少必要信息时才停止。'
             '缺少必要参数且无法从上下文确定时，先问清楚。'
@@ -820,6 +1546,19 @@ class McpOmniClient(AudioDialogNode):
             '如果工具执行失败、拒绝、超时或不可用，只能告诉用户本次命令没有执行成功，'
             '不能自动拆分成多步继续执行。'
             '如果只是聊天或普通提问，不需要调用工具，直接简洁回答。'
+        )
+
+    def _realtime_tool_instructions_with_memory(self) -> str:
+        instructions = self._omni_tool_instructions()
+        context = self._conversation_context_data()
+        if not context:
+            return instructions
+        return (
+            instructions
+            + '\n\n近期对话和工具结果记忆：'
+            + json.dumps(context, ensure_ascii=False)
+            + '\n回答“刚刚/之前/你都/已经”等追问时要优先参考这些记忆；'
+            + '如果用户的新请求要求读取当前画面或执行动作，仍然按工具说明调用工具。'
         )
 
     def _post_tool_instructions(self, user_text: str, tool_results: List[str]) -> str:
@@ -832,6 +1571,8 @@ class McpOmniClient(AudioDialogNode):
             '如果原始请求要求的任务没有对应工具，不要用相似工具替代，直接说明限制。'
             '如果原始请求包含多个顺序动作，而刚才结果只是完成其中一部分，'
             '请继续调用下一个尚未完成的工具；不要因为第一步成功就提前总结。'
+            '如果原始请求包含“所有/全部/每个水果”等集合任务，'
+            '一次 pick-and-place 成功通常只代表完成了一个目标，必须继续处理剩余可见目标；'
             '只有工具结果已经满足原始请求的全部步骤时，才直接总结结果，不要重复调用工具。'
             '没有明确的成功工具结果时，不要说动作已经成功；'
             '不要输出 JSON 或 XML。'
@@ -961,17 +1702,28 @@ class McpOmniClient(AudioDialogNode):
         request.name = name
         request.arguments_json = json.dumps(arguments, ensure_ascii=False)
         future = self.call_tool_client.call_async(request)
-        response = self._wait_for_service_future(future, self.call_tool_service)
+        response = self._wait_for_service_future(
+            future,
+            self.call_tool_service,
+            timeout_sec=self._timeout_for_tool_call(name),
+        )
         if response is None:
             return f'{self.call_tool_service} timed out'
         message = str(response.message or '').strip()
         if not message:
             status = 'success' if response.success else 'failed'
             message = f'{name} {status}'
+        status = 'success' if response.success else 'failed'
+        result_text = f'{name} {status}: {message}'
+        result_json = str(getattr(response, 'result_json', '') or '').strip()
+        memory_result_text = result_text
+        if result_json and result_json != '{}':
+            memory_result_text = f'{result_text}; result_json={result_json}'
+        self._capture_conversation_tool_result(memory_result_text)
         self._publish_status(
             f'omni_tool_result={name} success={bool(response.success)} message={message}'
         )
-        return message
+        return result_text
 
 
 
@@ -1001,10 +1753,24 @@ class McpOmniClient(AudioDialogNode):
 
 
 
-    def _wait_for_service_future(self, future, label: str):
+    def _timeout_for_tool_call(self, name: str) -> float:
+        long_tools = {
+            'pick_all_fruits_into_container',
+            'pick_and_place_into_container',
+            'pick_and_place_relative',
+            'grab_api_object',
+            'place_into_container',
+            'place_relative_to_object',
+        }
+        if str(name or '') in long_tools:
+            return max(float(self.mcp_tool_timeout_sec), float(self.mcp_long_tool_timeout_sec))
+        return float(self.mcp_tool_timeout_sec)
+
+    def _wait_for_service_future(self, future, label: str, timeout_sec: Optional[float] = None):
         event = threading.Event()
         future.add_done_callback(lambda _: event.set())
-        if not event.wait(timeout=max(0.1, self.mcp_tool_timeout_sec)):
+        wait_timeout = self.mcp_tool_timeout_sec if timeout_sec is None else timeout_sec
+        if not event.wait(timeout=max(0.1, float(wait_timeout))):
             self.get_logger().error(f'Timed out waiting for {label}.')
             return None
         try:
@@ -1184,6 +1950,14 @@ class McpOmniClient(AudioDialogNode):
         lowered = result_text.lower()
         failure_markers = (
             ' failed:',
+            ' failed ',
+            'failed during',
+            'failed while',
+            'failed moving',
+            'ik failed',
+            'path incomplete',
+            'did not report success',
+            'no scene memory',
             ' rejected:',
             ' unavailable',
             ' timed out',
@@ -1191,8 +1965,144 @@ class McpOmniClient(AudioDialogNode):
         )
         return any(marker in lowered for marker in failure_markers)
 
-    def _format_failed_tool_answer(self, failed_results: List[str]) -> str:
-        return '本次命令没有执行成功：' + '；'.join(failed_results)
+    def _tool_results_complete_user_request(self, user_text: str, tool_results: List[str]) -> bool:
+        if not tool_results:
+            return False
+        compact_request = ''.join(str(user_text or '').split())
+        success_results = [
+            text for text in tool_results
+            if self._is_terminal_action_success_result(text)
+        ]
+        if not success_results:
+            return False
+        if self._looks_like_multi_object_task(compact_request):
+            return any(self._is_pick_all_success_result(text) for text in success_results)
+        if any(self._is_pick_all_success_result(text) for text in success_results):
+            return True
+        if any(self._is_pick_and_place_success_result(text) for text in success_results):
+            return True
+        if any(self._is_place_success_result(text) for text in success_results):
+            return True
+        if (
+            any(self._is_grab_success_result(text) for text in success_results)
+            and not any(token in compact_request for token in ('放', '放到', '放进', '放入'))
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_multi_object_task(compact_request: str) -> bool:
+        text = str(compact_request or '').lower()
+        collection_markers = (
+            '所有',
+            '全部',
+            '每个',
+            '每一',
+            '每种',
+            '都',
+            'all',
+            'every',
+        )
+        object_markers = (
+            '水果',
+            '物体',
+            '东西',
+            '目标',
+            'fruit',
+            'fruits',
+            'object',
+            'objects',
+        )
+        return (
+            any(marker in text for marker in collection_markers)
+            and any(marker in text for marker in object_markers)
+        )
+
+    def _is_terminal_action_success_result(self, result_text: str) -> bool:
+        lowered = str(result_text or '').lower()
+        return (
+            ' success:' in lowered
+            and ' failed:' not in lowered
+            and ' rejected:' not in lowered
+            and ' unavailable' not in lowered
+            and ' timed out' not in lowered
+        )
+
+    def _is_pick_and_place_success_result(self, result_text: str) -> bool:
+        lowered = str(result_text or '').lower()
+        return (
+            'pick_and_place_relative success:' in lowered
+            or 'pick_and_place_into_container success:' in lowered
+        )
+
+    def _is_pick_all_success_result(self, result_text: str) -> bool:
+        return 'pick_all_fruits_into_container success:' in str(result_text or '').lower()
+
+    def _is_place_success_result(self, result_text: str) -> bool:
+        lowered = str(result_text or '').lower()
+        return (
+            'place_relative_to_object success:' in lowered
+            or 'place_into_container success:' in lowered
+        )
+
+    def _format_failed_tool_answer(self, user_text: str, failed_results: List[str]) -> str:
+        return self._final_text_from_tool_results(user_text, failed_results, success=False)
+
+    def _format_success_tool_answer(self, user_text: str, tool_results: List[str]) -> str:
+        return self._final_text_from_tool_results(user_text, tool_results, success=True)
+
+    def _final_text_from_tool_results(
+        self,
+        user_text: str,
+        tool_results: List[str],
+        success: bool,
+    ) -> str:
+        fallback = (
+            ('任务已完成：' if success else '本次命令没有执行成功：')
+            + ('；'.join(tool_results) if tool_results else ('已完成' if success else '没有工具返回结果'))
+        )
+        try:
+            from openai import OpenAI
+        except ImportError:
+            return fallback
+        try:
+            client = OpenAI(
+                api_key=self._api_key_from_env(self.omni_api_key_env),
+                base_url=self.omni_base_url,
+                timeout=self.omni_timeout,
+            )
+            response = client.chat.completions.create(
+                model=self.omni_text_model,
+                messages=[
+                    {
+                        'role': 'system',
+                        'content': (
+                            '你是机械臂任务结果播报助手。请只根据工具返回结果回答用户，'
+                            '不要编造没有发生的动作，不要输出 JSON，不要复述大段内部日志。'
+                            '如果结果成功，用自然中文简洁说明完成了什么；'
+                            '如果失败，用自然中文说明没有成功和关键原因。'
+                        ),
+                    },
+                    {
+                        'role': 'user',
+                        'content': json.dumps({
+                            'original_user_request': str(user_text or ''),
+                            'conversation_context': self._conversation_context_data(),
+                            'tool_success': bool(success),
+                            'tool_results': tool_results,
+                            'output_requirement': '输出给文本框的一到两句中文自然回复',
+                        }, ensure_ascii=False),
+                    },
+                ],
+                modalities=['text'],
+                stream=False,
+                max_tokens=220,
+            )
+            text = str(response.choices[0].message.content or '').strip()
+            return text or fallback
+        except Exception as exc:
+            self.get_logger().warn(f'Final text generation failed: {exc}')
+            return fallback
 
     def _silence_pcm_bytes(self, byte_count: int) -> bytes:
         if byte_count % 2:

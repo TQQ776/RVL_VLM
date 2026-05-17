@@ -11,13 +11,15 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/CallTool.srv"
   "srv/ListTools.srv"
   "srv/MoveAxis.srv"
-  "srv/ObjectName.srv"
+  "srv/PlaceIntoContainer.srv"
+  "srv/PlaceRelative.srv"
   DEPENDENCIES std_msgs
 )
 
 ament_python_install_package(mcp_nodes)
 
 install(PROGRAMS
+  scripts/camera_viewer
   scripts/mcp_server
   scripts/mcp_omni_client
   DESTINATION lib/${PROJECT_NAME}

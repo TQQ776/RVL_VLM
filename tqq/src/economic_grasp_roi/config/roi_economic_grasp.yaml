@@ -6,6 +6,7 @@
     joint_states_topic: /joint_states
     api_detections_topic: /mcp_omni_client/api_detections_json
     target_command_topic: /economic_grasp_roi/target_class_name
+    emergency_stop_topic: /mcp/emergency_stop
     grasp_result_topic: /economic_grasp_roi/grasp_result
     enable_api_bbox: true
     auto_execute_api_bbox: true
@@ -22,6 +23,8 @@
 
     ik_service: /compute_ik
     cartesian_path_service: /compute_cartesian_path
+    move_z_service: /mcp_server/move_z_cm
+    use_move_z_service_for_descend: true
     move_group_action: /move_action
     trajectory_action: /fr3_arm_controller/follow_joint_trajectory
     plan_only: false
@@ -30,7 +33,15 @@
     service_wait_timeout_sec: 5.0
     action_wait_timeout_sec: 10.0
     move_group_result_timeout_sec: 90.0
+    tf_wait_timeout_sec: 10.0
     goal_joint_tolerance: 0.01
+    # Reject MoveIt plans that swing joints too far from the current state.
+    # Joint 7 is wrist roll, so it is ignored by this guard.
+    # 1.0472 rad ~= 60 deg per checked joint; 4.18879 rad ~= 240 deg total over checked joints.
+    max_moveit_joint_delta_rad: 1.0471975511965976
+    max_moveit_total_joint_delta_rad: 4.1887902047863905
+    moveit_joint_delta_guard_ignore_joints:
+      - fr3_joint7
     max_velocity_scaling: 0.01
     max_acceleration_scaling: 0.01
     num_planning_attempts: 5
@@ -43,7 +54,8 @@
     cartesian_min_fraction: 0.95
     cartesian_descend_duration_sec: 6.0
 
-    roi_window_name: EconomicGrasp ROI Selector
+    roi_window_enabled: false
+    roi_window_name: 抓取检测框
     roi_padding_px: 8
     depth_unit_scale: 0.001
     min_depth_m: 0.05
@@ -88,7 +100,7 @@
     target_offset_xyz_base: [0.0, 0.0, -0.04]
     min_grasp_z_m: -10.0
 
-    popup_preview_before_execute: true
+    popup_preview_before_execute: false
     popup_preview_require_confirmation: false
     popup_preview_max_points: 20000
     popup_preview_frame_size_m: 0.08

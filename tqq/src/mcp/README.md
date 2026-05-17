@@ -11,9 +11,12 @@ Voice-driven robot tools for FR3.
 /mcp_server/move_x_cm
 /mcp_server/move_y_cm
 /mcp_server/move_z_cm
-/mcp_server/grab_object
 /mcp_server/open_gripper
 /mcp_server/close_gripper
+/mcp_server/place_relative_to_object
+/mcp_server/place_into_container
+/mcp_server/list_tools
+/mcp_server/call_tool
 ```
 
 `go_home` uses the saved home joints from the `control` package.
@@ -33,12 +36,11 @@ The axis services reject any single request whose absolute distance is greater t
 If a robot tool is rejected or fails, the MCP client reports the failure directly
 and does not split the request into smaller motions automatically.
 
-For API-vision grasping, `mcp_omni_client` sends the latest camera image to the
-vision model and publishes a YOLO-compatible detection JSON on
-`/mcp_omni_client/api_detections_json`. The control node then uses the API box
-center, aligned depth, TF to `fr3_link0`, MoveIt IK/execution, descends about
-3 cm on the base-frame Z axis, and closes the gripper after the arm reaches the
-target.
+For API-vision grasping, `mcp_server` sends the latest camera image to the
+vision model, publishes detection JSON on `/mcp_omni_client/api_detections_json`,
+and sends a one-shot target command to the EconomicGrasp ROI controller. The ROI
+controller uses the API box, RGB-D points, TF to `fr3_link0`, MoveIt planning,
+and the Franka gripper to execute the grasp.
 
 ## Build
 
@@ -53,21 +55,21 @@ source install/setup.bash
 
 ### One-Command API-Vision Grasp Stack
 
-This starts RealSense, FR3 MoveIt, hand-eye TF, the target controller,
-`mcp_server`, and `mcp_omni_client` together. YOLO is disabled by default;
-object recognition is done through the vision API:
+This starts RealSense, FR3 MoveIt, hand-eye TF, EconomicGrasp ROI,
+`mcp_server`, and `mcp_omni_client` together. Object recognition is done
+through the vision API:
 
 ```bash
 source ~/TQQ_ws/setup_franka.sh
 export DASHSCOPE_API_KEY=your_dashscope_key
 
-ros2 launch mcp llm_yolo_grasp.launch.py
+ros2 launch mcp llm_api_grasp.launch.py
 ```
 
 Useful overrides:
 
 ```bash
-ros2 launch mcp llm_yolo_grasp.launch.py \
+ros2 launch mcp llm_api_grasp.launch.py \
   robot_ip:=192.168.22.212 \
   handeye_name:=fr3_d435i_handeye \
   max_velocity_scaling:=0.01 \
@@ -77,7 +79,7 @@ ros2 launch mcp llm_yolo_grasp.launch.py \
 If one part is already running, disable it:
 
 ```bash
-ros2 launch mcp llm_yolo_grasp.launch.py \
+ros2 launch mcp llm_api_grasp.launch.py \
   launch_camera:=false \
   launch_moveit:=false
 ```
@@ -194,9 +196,10 @@ ros2 service call /mcp_server/go_home std_srvs/srv/Trigger {}
 ros2 service call /mcp_server/move_x_cm mcp/srv/MoveAxis "{centimeters: 2.0}"
 ros2 service call /mcp_server/move_y_cm mcp/srv/MoveAxis "{centimeters: -2.0}"
 ros2 service call /mcp_server/move_z_cm mcp/srv/MoveAxis "{centimeters: 1.0}"
-ros2 service call /mcp_server/grab_object mcp/srv/ObjectName "{name: orange}"
 ros2 service call /mcp_server/open_gripper std_srvs/srv/Trigger {}
 ros2 service call /mcp_server/close_gripper std_srvs/srv/Trigger {}
+ros2 service call /mcp_server/list_tools mcp/srv/ListTools {}
+ros2 service call /mcp_server/call_tool mcp/srv/CallTool "{name: grab_api_object, arguments_json: '{\"object_name\":\"orange\",\"motion_speed\":0.05}'}"
 ```
 
 Change the single-step limit in `config/mcp_server.yaml`:

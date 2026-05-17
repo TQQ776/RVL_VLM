@@ -777,7 +777,18 @@ class AudioDialogNode(Node):
 
     def _publish_response(self, text: str) -> None:
         self.response_pub.publish(String(data=text))
+        self._publish_response_to_text_popup(text)
         self._publish_status(f'response={text}')
+
+    def _publish_response_to_text_popup(self, text: str) -> None:
+        with self._text_popup_lock:
+            window = self._text_popup_window
+        if window is None:
+            return
+        try:
+            window.enqueue_assistant_message(text)
+        except Exception as exc:
+            self.get_logger().warn(f'Failed to update text popup response immediately: {exc}')
 
 
 class TextConversationWindow:
@@ -810,6 +821,7 @@ class TextConversationWindow:
         self.processing = False
         self.recording = False
         self.action_buttons = []
+        self._async_displayed_answers = []
 
         self.root = tk.Tk()
         self.root.title(title)
@@ -849,17 +861,32 @@ class TextConversationWindow:
         if self.action_callbacks:
             actions = ttk.Frame(frame)
             actions.pack(fill='x', pady=(8, 0))
-            for label, callback in self.action_callbacks:
-                button = ttk.Button(
-                    actions,
-                    text=str(label),
-                    command=lambda item_label=label, item_callback=callback: self.run_action(
+            for item in self.action_callbacks:
+                label, callback, options = self._normalize_action_callback(item)
+                button_class = tk.Button if options.get('danger') else ttk.Button
+                button_kwargs = {
+                    'text': str(label),
+                    'command': lambda item_label=label, item_callback=callback, item_options=options: self.run_action(
                         item_label,
                         item_callback,
+                        item_options,
                     ),
+                }
+                if options.get('danger'):
+                    button_kwargs.update({
+                        'bg': '#b00020',
+                        'fg': 'white',
+                        'activebackground': '#d32f2f',
+                        'activeforeground': 'white',
+                        'relief': 'raised',
+                        'font': ('TkDefaultFont', 10, 'bold'),
+                    })
+                button = button_class(
+                    actions,
+                    **button_kwargs,
                 )
                 button.pack(side='right', padx=(8, 0))
-                self.action_buttons.append(button)
+                self.action_buttons.append((button, options))
 
         self.input_text.bind('<Return>', self._submit_on_enter)
         self.input_text.bind('<Shift-Return>', self._insert_newline)
@@ -874,6 +901,15 @@ class TextConversationWindow:
         self.history.tag_configure('user_name', foreground='#0b5cad', font=('TkDefaultFont', 10, 'bold'))
         self.history.tag_configure('assistant_name', foreground='#126b35', font=('TkDefaultFont', 10, 'bold'))
         self.history.tag_configure('system', foreground='#666666')
+
+    @staticmethod
+    def _normalize_action_callback(item):
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            return str(item), lambda: '', {}
+        label = item[0]
+        callback = item[1]
+        options = item[2] if len(item) >= 3 and isinstance(item[2], dict) else {}
+        return label, callback, dict(options)
 
     def run(self) -> None:
         self.root.mainloop()
@@ -941,26 +977,34 @@ class TextConversationWindow:
             'answer': str(answer or '').strip(),
         })
 
-    def run_action(self, label: str, callback):
-        if self.processing or self.recording:
+    def run_action(self, label: str, callback, options=None):
+        options = dict(options or {})
+        always_enabled = bool(options.get('always_enabled'))
+        if (self.processing or self.recording) and not always_enabled:
             return 'break'
         label = str(label or '').strip()
         if label:
             self._append_message('我', label, name_tag='user_name')
-        self._set_processing(True)
+        owns_processing = not always_enabled or not self.processing
+        if owns_processing:
+            self._set_processing(True)
         threading.Thread(
             target=self._action_worker,
-            args=(label, callback),
+            args=(label, callback, owns_processing),
             daemon=True,
         ).start()
         return 'break'
 
-    def _action_worker(self, label: str, callback) -> None:
+    def _action_worker(self, label: str, callback, owns_processing: bool) -> None:
         try:
             answer = str(callback() or '').strip()
         except Exception as exc:
             answer = f'{label or "快捷操作"}失败：{exc}'
-        self.result_queue.put(answer)
+        self.result_queue.put({
+            'type': 'action',
+            'answer': answer,
+            'owns_processing': bool(owns_processing),
+        })
 
     def _poll_results(self) -> None:
         try:
@@ -968,14 +1012,46 @@ class TextConversationWindow:
                 item = self.result_queue.get_nowait()
                 if isinstance(item, dict) and item.get('type') == 'voice':
                     self._handle_voice_result(item)
+                elif isinstance(item, dict) and item.get('type') == 'action':
+                    self._handle_action_result(item)
+                elif isinstance(item, dict) and item.get('type') == 'assistant_message':
+                    self._handle_assistant_message(item)
                 else:
                     answer = str(item or '').strip()
-                    if answer:
+                    if answer and not self._consume_async_answer(answer):
                         self._append_message('助手', answer, name_tag='assistant_name')
                     self._set_processing(False)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_results)
+
+    def enqueue_assistant_message(self, text: str) -> None:
+        answer = str(text or '').strip()
+        if not answer:
+            return
+        self.result_queue.put({
+            'type': 'assistant_message',
+            'answer': answer,
+        })
+
+    def _handle_assistant_message(self, item: dict) -> None:
+        answer = str(item.get('answer') or '').strip()
+        if not answer:
+            return
+        self._append_message('助手', answer, name_tag='assistant_name')
+        self._async_displayed_answers.append(answer)
+        if len(self._async_displayed_answers) > 20:
+            self._async_displayed_answers = self._async_displayed_answers[-20:]
+
+    def _consume_async_answer(self, answer: str) -> bool:
+        answer = str(answer or '').strip()
+        if not answer:
+            return False
+        for index, displayed in enumerate(self._async_displayed_answers):
+            if displayed == answer:
+                del self._async_displayed_answers[index]
+                return True
+        return False
 
     def _handle_voice_result(self, item: dict) -> None:
         self.recording = bool(item.get('recording'))
@@ -983,9 +1059,16 @@ class TextConversationWindow:
         answer = str(item.get('answer') or '').strip()
         if transcript:
             self._append_message('我', transcript, name_tag='user_name')
-        if answer and not self.recording:
+        if answer and not self.recording and not self._consume_async_answer(answer):
             self._append_message('助手', answer, name_tag='assistant_name')
         self._set_processing(False)
+
+    def _handle_action_result(self, item: dict) -> None:
+        answer = str(item.get('answer') or '').strip()
+        if answer and not self._consume_async_answer(answer):
+            self._append_message('助手', answer, name_tag='assistant_name')
+        if bool(item.get('owns_processing')):
+            self._set_processing(False)
 
     def _append_message(self, speaker: str, text: str, name_tag: str) -> None:
         self.history.configure(state='normal')
@@ -1000,8 +1083,11 @@ class TextConversationWindow:
         self.processing = is_processing
         state = 'disabled' if is_processing or self.recording else 'normal'
         self.send_button.configure(state=state)
-        for button in self.action_buttons:
-            button.configure(state=state)
+        for button, options in self.action_buttons:
+            if options.get('always_enabled'):
+                button.configure(state='normal')
+            else:
+                button.configure(state=state)
         if self.recording:
             self.voice_button.configure(text='停止录音并发送', state='normal')
             self.close_button.configure(state='disabled')

@@ -1,10 +1,10 @@
-# RVL_VLM-VR / FR3 Omni 视觉语言抓取项目
+# RVL_VLM / FR3 Omni 视觉语言抓取项目
 
 ## 项目演示 Demo
 
 下面三个视频是当前项目的核心演示，建议先看 Demo，再阅读环境搭建和启动说明。
 GitHub README 不能直接内嵌仓库里的 LFS MP4 播放器，所以这里放置可直接播放的 GIF 预览；
-点击标题可打开完整 MP4 视频。项目最后还有VR遥操的apk版本实现。
+点击标题可打开完整 MP4 视频。
 
 ### 基础移动和视觉识别
 
@@ -74,7 +74,6 @@ RViz / MoveIt      # 机械臂模型、规划场景和轨迹显示
 │       ├── economic_grasp_roi/   # API 框 -> ROI 点云 -> EconomicGrasp -> 机械臂抓取
 │       ├── control/              # 旧的目标点控制、回 home 等工具
 │       ├── franka_camera/        # RealSense / ArUco / 手眼标定辅助
-│       ├── franka_vr_teleop/     # Quest3 原始 VR 遥操，非 Servo 版本
 │       ├── easy_handeye2/        # 手眼标定依赖
 │       └── audio_dialog/         # 对话框/音频录制基础包
 ├── third_party/
@@ -145,7 +144,7 @@ sudo apt update
 sudo apt install -y git git-lfs
 git lfs install
 
-git clone git@github.com:TQQ776/RVL_VLM-VR.git TQQ_ws
+git clone git@github.com:TQQ776/RVL_VLM.git TQQ_ws
 cd ~/TQQ_ws
 git lfs pull
 ```
@@ -592,7 +591,7 @@ mcp_omni_client 对话框客户端
 source ~/TQQ_ws/setup_franka.sh
 export DASHSCOPE_API_KEY=你的_DashScope_API_Key
 
-ros2 launch mcp llm_yolo_grasp.launch.py \
+ros2 launch mcp llm_api_grasp.launch.py \
   robot_ip:=192.168.22.212 \
   camera_serial_no:=327122079035 \
   use_fake_hardware:=false
@@ -829,7 +828,7 @@ source install/setup.bash
 有两个 RealSense 时，必须指定手部 D435i：
 
 ```bash
-ros2 launch mcp llm_yolo_grasp.launch.py camera_serial_no:=327122079035
+ros2 launch mcp llm_api_grasp.launch.py camera_serial_no:=327122079035
 ```
 
 如果改 YAML，序列号要加引号：
@@ -920,32 +919,7 @@ cartesian_descend_m: 0.08
 
 如果物体更高或场景更危险，可以先增大 `pre_grasp_lift_m`，再降低速度。
 
-## 19. VR 遥操说明
-
-Quest3 原始 VR 遥操仍保留在：
-
-```text
-~/TQQ_ws/tqq/src/franka_vr_teleop
-```
-
-详细安装和 Unity APK 设置见：
-
-```text
-~/TQQ_ws/README_VR_TELEOP_ORIGINAL.md
-```
-
-启动：
-
-```bash
-source ~/TQQ_ws/setup_franka.sh
-ros2 launch franka_vr_teleop quest3_franka_teleop.launch.py \
-  robot_ip:=192.168.22.212 \
-  use_fake_hardware:=false
-```
-
-注意：MoveIt Servo 版 VR 遥操代码已经删除，当前保留的是原始 Cartesian velocity 直控版本。
-
-## 20. 最小启动清单
+## 19. 最小启动清单
 
 如果你已经完成所有安装、编译、标定，日常只需要：
 
@@ -954,7 +928,7 @@ cd ~/TQQ_ws
 source setup_franka.sh
 export DASHSCOPE_API_KEY=你的_DashScope_API_Key
 
-ros2 launch mcp llm_yolo_grasp.launch.py \
+ros2 launch mcp llm_api_grasp.launch.py \
   robot_ip:=192.168.22.212 \
   camera_serial_no:=327122079035 \
   use_fake_hardware:=false

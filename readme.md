@@ -8,7 +8,7 @@ GitHub README 不能直接内嵌仓库里的 LFS MP4 播放器，所以这里放
 
 ### 基础移动和视觉识别
 
-[完整 MP4 视频](<videos/基础移动和视觉识别.mp4>)
+[完整 MP4 视频](<videos/基础移动和视觉识别 .mp4>)
 
 ![基础移动和视觉识别](<videos/previews/基础移动和视觉识别.gif>)
 
@@ -18,9 +18,9 @@ GitHub README 不能直接内嵌仓库里的 LFS MP4 播放器，所以这里放
 
 ![指定物体放置位置](<videos/previews/指定物体放置位置.gif>)
 
-### 指定类别放进篮子里
+### 指定类别放置位置
 
-[完整 MP4 视频](<videos/指定类别放进篮子里.mp4>)
+[完整 MP4 视频](<videos/指定类别放置位置.mp4>)
 
 ![指定类别放进篮子里](<videos/previews/指定类别放进篮子里.gif>)
 
